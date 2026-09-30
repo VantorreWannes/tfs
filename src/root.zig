@@ -1,17 +1,15 @@
 const std = @import("std");
-const Io = std.Io;
-const File = Io.File;
 
-inline fn readInt(r: *std.Io.Reader, comptime T: type) !T {
+inline fn readInt(reader: anytype, comptime T: type) !T {
     var buf: [@sizeOf(T)]u8 = undefined;
-    try r.readSliceAll(&buf);
+    try reader.readSliceAll(&buf);
     return std.mem.readInt(T, &buf, .little);
 }
 
-inline fn writeInt(w: *std.Io.Writer, comptime T: type, val: T) !void {
+inline fn writeInt(writer: anytype, comptime T: type, val: T) !void {
     var buf: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &buf, val, .little);
-    try w.writeAll(&buf);
+    try writer.writeAll(&buf);
 }
 
 pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
@@ -92,18 +90,26 @@ pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
         };
 
         nodes: std.ArrayList(Pair),
+        weights: std.ArrayList(u64),
         lookup: std.HashMap(Key, I, KeyContext, 80),
 
         pub fn init(allocator: std.mem.Allocator) !Self {
             return .{
                 .nodes = try std.ArrayList(Pair).initCapacity(allocator, 65536),
+                .weights = try std.ArrayList(u64).initCapacity(allocator, 65536),
                 .lookup = std.HashMap(Key, I, KeyContext, 80).init(allocator),
             };
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.lookup.deinit();
+            self.weights.deinit(allocator);
             self.nodes.deinit(allocator);
+        }
+
+        pub inline fn weightOf(self: *const Self, id: I) u64 {
+            if (id < LEAF_LIMIT) return @sizeOf(L);
+            return self.weights.items[id - LEAF_LIMIT];
         }
 
         pub fn rebuildIndex(self: *Self) !void {
@@ -121,12 +127,14 @@ pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
             }
 
             const id: I = @intCast(LEAF_LIMIT + self.nodes.items.len);
+            const w = self.weightOf(l) + self.weightOf(r);
+
             try self.nodes.append(allocator, .{ .l = l, .r = r });
+            try self.weights.append(allocator, w);
             try self.lookup.put(key, id);
             return id;
         }
 
-        /// High-speed Fast-BPE Ingestion
         fn ingestChunk(self: *Self, allocator: std.mem.Allocator, input_symbols: []const I) !I {
             if (input_symbols.len == 0) return 0;
             if (input_symbols.len == 1) return input_symbols[0];
@@ -142,7 +150,6 @@ pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
             var dst = buf_b;
             var src_len = input_symbols.len;
 
-            // Phase 1: Sliding Greedy Match against existing rules (Technique #1)
             while (src_len > 1) {
                 var matched_any = false;
                 var dst_idx: usize = 0;
@@ -172,14 +179,12 @@ pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
                 if (!matched_any) break;
             }
 
-            // Phase 2: Multi-Pair Geometric BPE (Techniques #2 & #4)
             var counts = std.HashMap(Key, u32, KeyContext, 80).init(allocator);
             defer counts.deinit();
 
             while (src_len > 1) {
                 counts.clearRetainingCapacity();
 
-                // 1. Count frequencies across the chunk
                 var max_freq: u32 = 0;
                 for (0..src_len - 1) |i| {
                     const k = Key{ .l = src[i], .r = src[i + 1] };
@@ -194,11 +199,8 @@ pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
                     }
                 }
 
-                // Technique #4: Stop if no pair repeats
                 if (max_freq < 2) break;
 
-                // Technique #2: Dynamic Top-Tier Threshold
-                // Batch replace all pairs in the upper frequency half in ONE pass
                 const threshold = @max(2, max_freq / 2);
 
                 var dst_idx: usize = 0;
@@ -232,7 +234,6 @@ pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
                 if (!replaced_any) break;
             }
 
-            // Phase 3: Final tree reduction to a single root node
             while (src_len > 1) {
                 var dst_idx: usize = 0;
                 var i: usize = 0;
@@ -264,7 +265,7 @@ pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
             const num_chunks = (leaves.len + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
             if (num_chunks == 1) {
-                var chunk_leaves = try allocator.alloc(I, leaves.len);
+                const chunk_leaves = try allocator.alloc(I, leaves.len);
                 defer allocator.free(chunk_leaves);
                 for (leaves, 0..) |sym, i| {
                     chunk_leaves[i] = @as(I, sym);
@@ -272,10 +273,10 @@ pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
                 return self.ingestChunk(allocator, chunk_leaves);
             }
 
-            var chunk_roots = try allocator.alloc(I, num_chunks);
+            const chunk_roots = try allocator.alloc(I, num_chunks);
             defer allocator.free(chunk_roots);
 
-            var chunk_buf = try allocator.alloc(I, CHUNK_SIZE);
+            const chunk_buf = try allocator.alloc(I, CHUNK_SIZE);
             defer allocator.free(chunk_buf);
 
             for (0..num_chunks) |ci| {
@@ -293,7 +294,87 @@ pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
             return self.ingestChunk(allocator, chunk_roots);
         }
 
-        pub fn reconstruct(self: *const Self, allocator: std.mem.Allocator, root_id: I, writer: *std.Io.Writer) !void {
+        const Frame = struct {
+            id: I,
+            offset: u64,
+            len: u64,
+        };
+
+        pub fn readSlice(
+            self: *const Self,
+            allocator: std.mem.Allocator,
+            root_id: I,
+            offset: u64,
+            dest: []u8,
+        ) !usize {
+            const total = self.weightOf(root_id);
+            if (offset >= total or dest.len == 0) return 0;
+
+            const target_len = @min(dest.len, @as(usize, @intCast(total - offset)));
+            var cursor: usize = 0;
+
+            var stack_buf: [128]Frame = undefined;
+            var dynamic_stack: ?std.ArrayListUnmanaged(Frame) = null;
+            defer if (dynamic_stack) |*ds| ds.deinit(allocator);
+
+            var depth: usize = 1;
+            stack_buf[0] = .{ .id = root_id, .offset = offset, .len = target_len };
+
+            while (depth > 0) {
+                depth -= 1;
+                const top = if (dynamic_stack) |ds|
+                    if (depth >= stack_buf.len) ds.items[depth - stack_buf.len] else stack_buf[depth]
+                else
+                    stack_buf[depth];
+
+                if (top.id < LEAF_LIMIT) {
+                    const leaf_val: L = @intCast(top.id);
+                    const leaf_bytes = std.mem.asBytes(&leaf_val);
+
+                    for (leaf_bytes[top.offset..]) |b| {
+                        if (cursor >= target_len) return cursor;
+                        dest[cursor] = b;
+                        cursor += 1;
+                    }
+                    continue;
+                }
+
+                const pair = self.nodes.items[top.id - LEAF_LIMIT];
+                const l_size = self.weightOf(pair.l);
+
+                if (top.offset + top.len > l_size) {
+                    const r_start = if (top.offset > l_size) top.offset - l_size else 0;
+                    const r_avail = (top.offset + top.len) - l_size;
+                    const r_read = @min(r_avail, self.weightOf(pair.r) - r_start);
+                    const next_frame = Frame{ .id = pair.r, .offset = r_start, .len = r_read };
+
+                    if (depth < stack_buf.len) {
+                        stack_buf[depth] = next_frame;
+                    } else {
+                        if (dynamic_stack == null) dynamic_stack = .{};
+                        try dynamic_stack.?.append(allocator, next_frame);
+                    }
+                    depth += 1;
+                }
+
+                if (top.offset < l_size) {
+                    const l_read = @min(top.len, l_size - top.offset);
+                    const next_frame = Frame{ .id = pair.l, .offset = top.offset, .len = l_read };
+
+                    if (depth < stack_buf.len) {
+                        stack_buf[depth] = next_frame;
+                    } else {
+                        if (dynamic_stack == null) dynamic_stack = .{};
+                        try dynamic_stack.?.append(allocator, next_frame);
+                    }
+                    depth += 1;
+                }
+            }
+
+            return cursor;
+        }
+
+        pub fn reconstruct(self: *const Self, allocator: std.mem.Allocator, root_id: I, writer: anytype) !void {
             if (root_id == 0) return;
 
             var stack = try std.ArrayList(I).initCapacity(allocator, 4096);
@@ -354,7 +435,7 @@ pub fn Catalog(comptime Index: type) type {
             self.entries.deinit(allocator);
         }
 
-        pub fn readFrom(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Self {
+        pub fn readFrom(allocator: std.mem.Allocator, reader: anytype) !Self {
             const entry_count = try readInt(reader, u64);
             var self = try Self.init(allocator);
 
@@ -399,6 +480,18 @@ pub fn Archive(comptime Index: type, comptime Leaf: type) type {
         pub const L = Leaf;
         pub const MAGIC: [4]u8 = "TFSD".*;
 
+        pub const Kind = enum { file, directory };
+        pub const Stat = struct {
+            size: u64,
+            root_id: I,
+            kind: Kind,
+        };
+
+        pub const DirEntry = struct {
+            name: []const u8,
+            stat: Stat,
+        };
+
         dag: Dag,
         catalog: Cat,
 
@@ -414,14 +507,14 @@ pub fn Archive(comptime Index: type, comptime Leaf: type) type {
             self.dag.deinit(allocator);
         }
 
-        pub fn readCatalogOnly(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Cat {
+        pub fn readCatalogOnly(allocator: std.mem.Allocator, reader: anytype) !Cat {
             var magic: [4]u8 = undefined;
             try reader.readSliceAll(&magic);
             if (!std.mem.eql(u8, &magic, &MAGIC)) return error.InvalidArchiveFormat;
             return try Cat.readFrom(allocator, reader);
         }
 
-        pub fn readFrom(allocator: std.mem.Allocator, reader: *std.Io.Reader, comptime rebuild_hash_index: bool) !Self {
+        pub fn readFrom(allocator: std.mem.Allocator, reader: anytype, comptime rebuild_hash_index: bool) !Self {
             var magic: [4]u8 = undefined;
             try reader.readSliceAll(&magic);
             if (!std.mem.eql(u8, &magic, &MAGIC)) return error.InvalidArchiveFormat;
@@ -430,8 +523,8 @@ pub fn Archive(comptime Index: type, comptime Leaf: type) type {
             const total_nodes = try readInt(reader, u64);
 
             var tier_counts: [Dag.NUM_TIERS]u64 = undefined;
-            for (&tier_counts) |*tc| {
-                tc.* = try readInt(reader, u64);
+            for (0..Dag.NUM_TIERS) |i| {
+                tier_counts[i] = try readInt(reader, u64);
             }
 
             var dag = try Dag.init(allocator);
@@ -448,8 +541,7 @@ pub fn Archive(comptime Index: type, comptime Leaf: type) type {
 
                 while (read_items < count) {
                     const to_read = @min(count - read_items, chunk_buf.len);
-                    const byte_slice = std.mem.sliceAsBytes(chunk_buf[0..to_read]);
-                    try reader.readSliceAll(byte_slice);
+                    try reader.readSliceAll(std.mem.sliceAsBytes(chunk_buf[0..to_read]));
 
                     for (0..to_read) |idx| {
                         dag.nodes.items[offset + read_items + idx] = .{
@@ -462,6 +554,11 @@ pub fn Archive(comptime Index: type, comptime Leaf: type) type {
                 offset += count;
             }
 
+            try dag.weights.resize(allocator, total_nodes);
+            for (dag.nodes.items, 0..) |p, idx| {
+                dag.weights.items[idx] = dag.weightOf(p.l) + dag.weightOf(p.r);
+            }
+
             if (rebuild_hash_index) {
                 try dag.rebuildIndex();
             }
@@ -469,7 +566,7 @@ pub fn Archive(comptime Index: type, comptime Leaf: type) type {
             return .{ .dag = dag, .catalog = catalog };
         }
 
-        pub fn writeTo(self: *const Self, writer: *std.Io.Writer) !void {
+        pub fn writeTo(self: *const Self, writer: anytype) !void {
             try writer.writeAll(&MAGIC);
             try writeInt(writer, u64, self.catalog.entries.items.len);
             for (self.catalog.entries.items) |e| {
@@ -527,9 +624,89 @@ pub fn Archive(comptime Index: type, comptime Leaf: type) type {
             return root_id;
         }
 
-        pub fn decodeStream(self: *const Self, allocator: std.mem.Allocator, name: []const u8, writer: *std.Io.Writer) !void {
+        pub fn decodeStream(self: *const Self, allocator: std.mem.Allocator, name: []const u8, writer: anytype) !void {
             const root_id = self.catalog.get(name) orelse return error.EntryNotFound;
             try self.dag.reconstruct(allocator, root_id, writer);
+        }
+
+        pub fn stat(self: *const Self, path: []const u8) ?Stat {
+            const clean = cleanPath(path);
+            if (self.isDirectory(clean)) {
+                return .{ .size = 0, .root_id = 0, .kind = .directory };
+            }
+            const root_id = self.catalog.get(clean) orelse return null;
+            return .{
+                .size = self.dag.weightOf(root_id),
+                .root_id = root_id,
+                .kind = .file,
+            };
+        }
+
+        pub fn readAt(
+            self: *const Self,
+            allocator: std.mem.Allocator,
+            path: []const u8,
+            offset: u64,
+            dest: []u8,
+        ) !usize {
+            const s = self.stat(path) orelse return error.FileNotFound;
+            if (s.kind != .file) return error.IsDirectory;
+            return self.dag.readSlice(allocator, s.root_id, offset, dest);
+        }
+
+        pub fn readDir(self: *const Self, allocator: std.mem.Allocator, dir_path: []const u8) ![]DirEntry {
+            const prefix = cleanPath(dir_path);
+            var results = std.ArrayList(DirEntry).init(allocator);
+            var seen = std.StringHashMap(void).init(allocator);
+            defer seen.deinit();
+
+            for (self.catalog.entries.items) |item| {
+                var rel = item.name;
+                if (prefix.len > 0) {
+                    if (!std.mem.startsWith(u8, item.name, prefix)) continue;
+                    if (item.name.len <= prefix.len or item.name[prefix.len] != '/') continue;
+                    rel = item.name[prefix.len + 1 ..];
+                }
+
+                if (std.mem.indexOfScalar(u8, rel, '/')) |slash| {
+                    const dir_name = rel[0..slash];
+                    if (!seen.contains(dir_name)) {
+                        try seen.put(dir_name, {});
+                        try results.append(allocator, .{
+                            .name = try allocator.dupe(u8, dir_name),
+                            .stat = .{ .size = 0, .root_id = 0, .kind = .directory },
+                        });
+                    }
+                } else {
+                    try results.append(allocator, .{
+                        .name = try allocator.dupe(u8, rel),
+                        .stat = .{
+                            .size = self.dag.weightOf(item.root_id),
+                            .root_id = item.root_id,
+                            .kind = .file,
+                        },
+                    });
+                }
+            }
+
+            return results.toOwnedSlice(allocator);
+        }
+
+        fn isDirectory(self: *const Self, path: []const u8) bool {
+            if (path.len == 0) return true;
+            for (self.catalog.entries.items) |e| {
+                if (e.name.len > path.len and std.mem.startsWith(u8, e.name, path) and e.name[path.len] == '/') {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        fn cleanPath(path: []const u8) []const u8 {
+            var p = path;
+            while (p.len > 0 and (p[0] == '/' or p[0] == '\\')) p = p[1..];
+            while (p.len > 0 and (p[p.len - 1] == '/' or p[p.len - 1] == '\\')) p = p[0 .. p.len - 1];
+            return p;
         }
     };
 }

@@ -1,5 +1,5 @@
 const std = @import("std");
-const tfs = @import("root.zig");
+const tfs = @import("tfs");
 
 const Archive = tfs.Archive(u32, u8);
 
