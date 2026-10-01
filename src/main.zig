@@ -60,8 +60,14 @@ pub fn Cli(
                         entry_name = explicit_name orelse if (is_stdin) "stdin" else std.fs.path.basename(input_path.?);
                     },
                     .decode => {
-                        entry_name = explicit_name orelse (positional[2] orelse return error.MissingEntryName);
-                        output_path = positional[3] orelse if (explicit_name != null and positional[2] != null) positional[2].? else "-";
+                        if (explicit_name) |name| {
+                            entry_name = name;
+                            output_path = positional[2] orelse entry_name;
+                        } else {
+                            entry_name = positional[2] orelse return error.MissingEntryName;
+                            // Default to extracting with the original entry name if output path is omitted
+                            output_path = positional[3] orelse entry_name;
+                        }
                     },
                     .list => {},
                 }
@@ -79,9 +85,16 @@ pub fn Cli(
         pub fn printUsage(io: std.Io) !void {
             try std.Io.File.stdout().writeStreamingAll(io,
                 \\Usage:
-                \\  tfs encode <archive> [input|-] [--name <entry_name>]
-                \\  tfs decode <archive> [entry_name] [output|-] [--name <entry_name>]
+                \\  tfs encode <archive> [input|-]    [--name <entry_name>]
+                \\  tfs decode <archive> <entry_name> [output|-]
                 \\  tfs list   <archive>
+                \\
+                \\Examples:
+                \\  tfs encode bundle.tfs data.txt
+                \\  tfs list   bundle.tfs
+                \\  tfs decode bundle.tfs data.txt              # extracts to ./data.txt
+                \\  tfs decode bundle.tfs data.txt restored.txt # extracts to ./restored.txt
+                \\  tfs decode bundle.tfs data.txt -            # streams to stdout
                 \\
             );
         }
@@ -141,6 +154,12 @@ pub fn Cli(
                     const out_path = options.output_path.?;
                     const is_stdout = std.mem.eql(u8, out_path, "-");
 
+                    if (!is_stdout) {
+                        if (std.fs.path.dirname(out_path)) |parent| {
+                            try cwd.createDirPath(io, parent);
+                        }
+                    }
+
                     var output_file = if (is_stdout)
                         std.Io.File.stdout()
                     else
@@ -189,7 +208,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     const args = try init.minimal.args.toSlice(arena);
-    const App = Cli(u32, 64, std.math.maxInt(u21));
+    const App = Cli(u32, 64, 131072);
 
     const options = App.Options.parse(args) catch {
         try App.printUsage(io);
