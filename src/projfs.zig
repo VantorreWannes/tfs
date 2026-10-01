@@ -507,17 +507,3 @@ pub fn mount(
 
     _ = WaitForSingleObject(shutdown_event, 0xFFFFFFFF);
 }
-
-const SpinLock = struct {
-    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-
-    pub fn lock(self: *SpinLock) void {
-        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    pub fn unlock(self: *SpinLock) void {
-        self.state.store(0, .release);
-    }
-};

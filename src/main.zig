@@ -393,28 +393,25 @@ pub fn Cli(
                         return error.UnsupportedPlatform;
                     }
 
+                    const mount_dir = options.output_path orelse return error.MissingMountFolder;
+                    try cwd.createDirPath(io, mount_dir);
+
                     if (cwd.openFile(io, options.archive_path, .{ .mode = .read_only, .lock = .none })) |archive_file| {
                         defer archive_file.close(io);
                         try archive.load(io, allocator, archive_file);
                     } else |_| {}
 
-                    var dedup = try Dedup.init(allocator, archive.buffer.offsets.items.len * 2);
+                    var dedup = try Dedup.init(allocator, 65536);
                     defer dedup.deinit(allocator);
-                    try archive.populateDedup(allocator, &dedup);
-
-                    const mount_dir = options.output_path orelse return error.MissingMountFolder;
-                    try cwd.createDirPath(io, mount_dir);
 
                     const State = struct {
                         const SpinLock = struct {
                             state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-
                             pub fn lock(self: *SpinLock) void {
                                 while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
                                     std.atomic.spinLoopHint();
                                 }
                             }
-
                             pub fn unlock(self: *SpinLock) void {
                                 self.state.store(0, .release);
                             }
@@ -425,6 +422,7 @@ pub fn Cli(
                         var g_dedup: *Dedup = undefined;
                         var g_lock: SpinLock = .{};
                         var g_count: usize = 0;
+                        var g_dirty: bool = false;
 
                         fn onFileWrite(a: *Archive, rel_path: []const u8, full_path: []const u8) anyerror!void {
                             var file = std.Io.Dir.cwd().openFile(g_io, full_path, .{ .mode = .read_only, .lock = .none }) catch return;
@@ -452,8 +450,9 @@ pub fn Cli(
 
                             const timestamp: i96 = std.Io.Clock.now(.real, g_io).nanoseconds;
                             try a.put(g_allocator, rel_path, res.root, res.byte_count, timestamp);
-
+                            g_dirty = true;
                             g_count += 1;
+
                             if (g_count % 100 == 0 or res.byte_count > 1024 * 1024) {
                                 std.debug.print("[live] Indexed {d} files (latest: {s})\n", .{ g_count, rel_path });
                             }
@@ -462,7 +461,9 @@ pub fn Cli(
                         fn onFileDelete(a: *Archive, rel_path: []const u8) anyerror!void {
                             g_lock.lock();
                             defer g_lock.unlock();
-                            _ = a.remove(g_allocator, rel_path);
+                            if (a.remove(g_allocator, rel_path)) {
+                                g_dirty = true;
+                            }
                         }
                     };
 
@@ -476,25 +477,33 @@ pub fn Cli(
                         mount_dir,
                         archive.entries.items.len,
                     });
-                    std.debug.print(" Live FastCDC tree indexing active.\n", .{});
                     std.debug.print(" Press Ctrl+C to unmount.\n", .{});
                     std.debug.print("====================================================\n", .{});
 
                     try projfs.mount(allocator, &archive, mount_dir, State.onFileWrite, State.onFileDelete);
 
-                    std.debug.print("\n[unmount] Stopping virtualization...\n", .{});
+                    std.debug.print("\n[unmount] Virtualization stopped.\n", .{});
 
-                    std.debug.print("[unmount] Writing archive to '{s}'...\n", .{options.archive_path});
-                    var archive_output = try cwd.createFile(io, options.archive_path, .{
-                        .truncate = true,
-                        .lock = .none,
-                    });
-                    defer archive_output.close(io);
-                    try archive.save(io, archive_output);
+                    if (State.g_dirty or archive.entries.items.len == 0) {
+                        std.debug.print("[unmount] Writing archive to '{s}'...\n", .{options.archive_path});
+                        var archive_output = try cwd.createFile(io, options.archive_path, .{
+                            .truncate = true,
+                            .lock = .none,
+                        });
+                        defer archive_output.close(io);
+                        try archive.save(io, archive_output);
+                    }
 
-                    std.debug.print("[unmount] Done. Total entries: {d}, total bytes indexed: {d}.\n", .{
+                    std.debug.print("[unmount] Resetting mount point '{s}'...\n", .{mount_dir});
+
+                    cwd.deleteTree(io, mount_dir) catch {
+                        std.debug.print("[warn] Background processes (Defender/Explorer) are still inspecting '{s}'.\n", .{mount_dir});
+                        std.debug.print("[warn] Mountpoint will clear once handles release.\n", .{});
+                    };
+
+                    std.debug.print("[unmount] Complete. {d} files committed to '{s}'.\n", .{
                         archive.entries.items.len,
-                        archive.buffer.bytes.items.len,
+                        options.archive_path,
                     });
                 },
             }
