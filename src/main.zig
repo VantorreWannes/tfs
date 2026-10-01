@@ -406,10 +406,25 @@ pub fn Cli(
                     try cwd.createDirPath(io, mount_dir);
 
                     const State = struct {
+                        const SpinLock = struct {
+                            state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+                            pub fn lock(self: *SpinLock) void {
+                                while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+                                    std.atomic.spinLoopHint();
+                                }
+                            }
+
+                            pub fn unlock(self: *SpinLock) void {
+                                self.state.store(0, .release);
+                            }
+                        };
+
                         var g_io: std.Io = undefined;
                         var g_allocator: std.mem.Allocator = undefined;
                         var g_dedup: *Dedup = undefined;
-                        var g_dirty: bool = false;
+                        var g_lock: SpinLock = .{};
+                        var g_count: usize = 0;
 
                         fn onFileWrite(a: *Archive, rel_path: []const u8, full_path: []const u8) anyerror!void {
                             var file = std.Io.Dir.cwd().openFile(g_io, full_path, .{ .mode = .read_only, .lock = .none }) catch return;
@@ -419,6 +434,10 @@ pub fn Cli(
                             var r = file.reader(g_io, &s_buf);
 
                             const seed: u64 = 0x5EED_0000;
+
+                            g_lock.lock();
+                            defer g_lock.unlock();
+
                             const res = try tfs.streamToIndex(
                                 Index,
                                 TargetChunkSize,
@@ -433,16 +452,17 @@ pub fn Cli(
 
                             const timestamp: i96 = std.Io.Clock.now(.real, g_io).nanoseconds;
                             try a.put(g_allocator, rel_path, res.root, res.byte_count, timestamp);
-                            g_dirty = true;
 
-                            std.debug.print("[live] + {s} ({d} bytes, root: {d})\n", .{ rel_path, res.byte_count, res.root });
+                            g_count += 1;
+                            if (g_count % 100 == 0 or res.byte_count > 1024 * 1024) {
+                                std.debug.print("[live] Indexed {d} files (latest: {s})\n", .{ g_count, rel_path });
+                            }
                         }
 
                         fn onFileDelete(a: *Archive, rel_path: []const u8) anyerror!void {
-                            if (a.remove(g_allocator, rel_path)) {
-                                g_dirty = true;
-                                std.debug.print("[live] - {s}\n", .{rel_path});
-                            }
+                            g_lock.lock();
+                            defer g_lock.unlock();
+                            _ = a.remove(g_allocator, rel_path);
                         }
                     };
 

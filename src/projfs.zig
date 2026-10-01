@@ -7,7 +7,6 @@ pub const E_FILENOTFOUND: HRESULT = -2147024894;
 pub const E_INSUFFICIENT_BUFFER: HRESULT = -2147024774;
 pub const E_ALREADY_EXISTS: HRESULT = -2147024713;
 
-// Official ProjectedFSLib.h bitmasks:
 pub const PRJ_NOTIFY_FILE_OPENED: u32 = 0x00000002;
 pub const PRJ_NOTIFY_NEW_FILE_CREATED: u32 = 0x00000004;
 pub const PRJ_NOTIFY_FILE_OVERWRITTEN: u32 = 0x00000008;
@@ -118,15 +117,22 @@ const PrjApi = struct {
 
     fn load() !PrjApi {
         const h = LoadLibraryA("ProjectedFSLib.dll") orelse return error.ProjFsUnavailable;
+        const Cast = struct {
+            inline fn proc(comptime T: type, handle: *anyopaque, name: [*:0]const u8) !T {
+                const ptr = GetProcAddress(handle, name) orelse return error.SymbolMissing;
+                return @ptrCast(@alignCast(ptr));
+            }
+        };
+
         return .{
-            .StartVirtualizing = @ptrCast(GetProcAddress(h, "PrjStartVirtualizing") orelse return error.SymbolMissing),
-            .StopVirtualizing = @ptrCast(GetProcAddress(h, "PrjStopVirtualizing") orelse return error.SymbolMissing),
-            .MarkDirectoryAsPlaceholder = @ptrCast(GetProcAddress(h, "PrjMarkDirectoryAsPlaceholder") orelse return error.SymbolMissing),
-            .FillDirEntryBuffer = @ptrCast(GetProcAddress(h, "PrjFillDirEntryBuffer") orelse return error.SymbolMissing),
-            .WriteFileData = @ptrCast(GetProcAddress(h, "PrjWriteFileData") orelse return error.SymbolMissing),
-            .WritePlaceholderInfo = @ptrCast(GetProcAddress(h, "PrjWritePlaceholderInfo") orelse return error.SymbolMissing),
-            .FileNameMatch = @ptrCast(GetProcAddress(h, "PrjFileNameMatch") orelse return error.SymbolMissing),
-            .FileNameCompare = @ptrCast(GetProcAddress(h, "PrjFileNameCompare") orelse return error.SymbolMissing),
+            .StartVirtualizing = try Cast.proc(@TypeOf(@as(PrjApi, undefined).StartVirtualizing), h, "PrjStartVirtualizing"),
+            .StopVirtualizing = try Cast.proc(@TypeOf(@as(PrjApi, undefined).StopVirtualizing), h, "PrjStopVirtualizing"),
+            .MarkDirectoryAsPlaceholder = try Cast.proc(@TypeOf(@as(PrjApi, undefined).MarkDirectoryAsPlaceholder), h, "PrjMarkDirectoryAsPlaceholder"),
+            .FillDirEntryBuffer = try Cast.proc(@TypeOf(@as(PrjApi, undefined).FillDirEntryBuffer), h, "PrjFillDirEntryBuffer"),
+            .WriteFileData = try Cast.proc(@TypeOf(@as(PrjApi, undefined).WriteFileData), h, "PrjWriteFileData"),
+            .WritePlaceholderInfo = try Cast.proc(@TypeOf(@as(PrjApi, undefined).WritePlaceholderInfo), h, "PrjWritePlaceholderInfo"),
+            .FileNameMatch = try Cast.proc(@TypeOf(@as(PrjApi, undefined).FileNameMatch), h, "PrjFileNameMatch"),
+            .FileNameCompare = try Cast.proc(@TypeOf(@as(PrjApi, undefined).FileNameCompare), h, "PrjFileNameCompare"),
         };
     }
 };
@@ -362,14 +368,13 @@ fn onNotification(
     const rel_path = toUtf8(&path_buf, data.FilePathName);
     if (rel_path.len == 0) return S_OK;
 
-    AcquireSRWLockExclusive(@ptrCast(&state.lock));
-    defer ReleaseSRWLockExclusive(@ptrCast(&state.lock));
-
-    if ((notification & (PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED | PRJ_NOTIFY_NEW_FILE_CREATED | PRJ_NOTIFY_FILE_OVERWRITTEN)) != 0) {
+    if ((notification & PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED) != 0) {
         var full_buf: [1024]u8 = undefined;
         const full_path = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ state.mount_dir, rel_path }) catch return S_OK;
         state.callbacks.on_file_write_fn(state.archive, rel_path, full_path) catch {};
     } else if ((notification & PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED) != 0) {
+        AcquireSRWLockExclusive(@ptrCast(&state.lock));
+        defer ReleaseSRWLockExclusive(@ptrCast(&state.lock));
         state.callbacks.on_file_delete_fn(state.archive, rel_path) catch {};
     }
     return S_OK;
@@ -473,11 +478,8 @@ pub fn mount(
     };
 
     const empty_root: [:0]const u16 = &[0:0]u16{};
-    const notif_mask: u32 = PRJ_NOTIFY_NEW_FILE_CREATED |
-        PRJ_NOTIFY_FILE_OVERWRITTEN |
-        PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED |
+    const notif_mask: u32 = PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED |
         PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED;
-
     const notif_mapping = [_]PRJ_NOTIFICATION_MAPPING{
         .{
             .NotificationBitMask = notif_mask,
@@ -505,3 +507,17 @@ pub fn mount(
 
     _ = WaitForSingleObject(shutdown_event, 0xFFFFFFFF);
 }
+
+const SpinLock = struct {
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn lock(self: *SpinLock) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn unlock(self: *SpinLock) void {
+        self.state.store(0, .release);
+    }
+};
