@@ -1,12 +1,28 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const DefaultFs = @import("root.zig").DefaultFs;
 
 pub const HRESULT = i32;
 pub const S_OK: HRESULT = 0;
-pub const E_FILENOTFOUND: HRESULT = @bitCast(@as(u32, 0x80070002));
-pub const E_INSUFFICIENT_BUFFER: HRESULT = @bitCast(@as(u32, 0x8007007A));
-pub const E_ALREADY_EXISTS: HRESULT = @bitCast(@as(u32, 0x800700B7));
+pub const E_FILENOTFOUND: HRESULT = -2147024894;
+pub const E_INSUFFICIENT_BUFFER: HRESULT = -2147024774;
+pub const E_ALREADY_EXISTS: HRESULT = -2147024713;
+
+// Official ProjectedFSLib.h bitmasks:
+pub const PRJ_NOTIFY_FILE_OPENED: u32 = 0x00000002;
+pub const PRJ_NOTIFY_NEW_FILE_CREATED: u32 = 0x00000004;
+pub const PRJ_NOTIFY_FILE_OVERWRITTEN: u32 = 0x00000008;
+pub const PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED: u32 = 0x00000400;
+pub const PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED: u32 = 0x00000800;
+
+pub const EntryInfo = struct {
+    root: u32,
+    size: u64,
+};
+
+pub const DirEntryInfo = struct {
+    path: []const u8,
+    size: u64,
+};
 
 const GUID = extern struct {
     Data1: u32,
@@ -29,6 +45,18 @@ const PRJ_CALLBACK_DATA = extern struct {
     InstanceContext: ?*anyopaque,
 };
 
+const PRJ_NOTIFICATION_PARAMETERS = extern struct {
+    PostCreate: extern struct {
+        NotificationMask: u32,
+    },
+    FileRenamed: extern struct {
+        NotificationMask: u32,
+    },
+    FileDeletedOnHandleClose: extern struct {
+        IsDirectory: u8,
+    },
+};
+
 const PRJ_FILE_BASIC_INFO = extern struct {
     IsDirectory: u8,
     _pad1: [7]u8 = @splat(0),
@@ -43,168 +71,76 @@ const PRJ_FILE_BASIC_INFO = extern struct {
 
 const PRJ_PLACEHOLDER_INFO = extern struct {
     FileBasicInfo: PRJ_FILE_BASIC_INFO,
-    EaInformation: extern struct {
-        EaBufferSize: u32 = 0,
-        OffsetToFirstEa: u32 = 0,
-    } = .{},
-    SecurityInformation: extern struct {
-        SecurityBufferSize: u32 = 0,
-        OffsetToSecurityDescriptor: u32 = 0,
-    } = .{},
-    StreamsInformation: extern struct {
-        StreamsInfoBufferSize: u32 = 0,
-        OffsetToFirstStreamInfo: u32 = 0,
-    } = .{},
-    VersionInfo: extern struct {
-        ProviderID: [128]u8 = @splat(0),
-        ContentID: [128]u8 = @splat(0),
-    } = .{},
+    EaBufferSize: u32 = 0,
+    OffsetToFirstEa: u32 = 0,
+    SecurityBufferSize: u32 = 0,
+    OffsetToSecurityDescriptor: u32 = 0,
+    StreamsInfoBufferSize: u32 = 0,
+    OffsetToFirstStreamInfo: u32 = 0,
+    ProviderID: [128]u8 = @splat(0),
+    ContentID: [128]u8 = @splat(0),
     VariableData: [1]u8 = @splat(0),
 };
 
-const PRJ_START_DIRECTORY_ENUMERATION_CB = *const fn (
-    data: *const PRJ_CALLBACK_DATA,
-    enumerationId: *const GUID,
-) callconv(.winapi) HRESULT;
+const PRJ_NOTIFICATION_MAPPING = extern struct {
+    NotificationBitMask: u32,
+    NotificationRoot: [*:0]const u16,
+};
 
-const PRJ_END_DIRECTORY_ENUMERATION_CB = *const fn (
-    data: *const PRJ_CALLBACK_DATA,
-    enumerationId: *const GUID,
-) callconv(.winapi) HRESULT;
-
-const PRJ_GET_DIRECTORY_ENUMERATION_CB = *const fn (
-    data: *const PRJ_CALLBACK_DATA,
-    enumerationId: *const GUID,
-    searchExpression: ?[*:0]const u16,
-    dirEntryBufferHandle: ?*anyopaque,
-) callconv(.winapi) HRESULT;
-
-const PRJ_GET_PLACEHOLDER_INFO_CB = *const fn (
-    data: *const PRJ_CALLBACK_DATA,
-) callconv(.winapi) HRESULT;
-
-const PRJ_GET_FILE_DATA_CB = *const fn (
-    data: *const PRJ_CALLBACK_DATA,
-    byteOffset: u64,
-    length: u32,
-) callconv(.winapi) HRESULT;
+const PRJ_START_VIRTUALIZING_OPTIONS = extern struct {
+    Flags: u32 = 0,
+    PoolThreadCount: u32 = 0,
+    ConcurrentThreadCount: u32 = 0,
+    NotificationMappings: ?[*]const PRJ_NOTIFICATION_MAPPING = null,
+    NotificationMappingsCount: u32 = 0,
+};
 
 const PRJ_CALLBACKS = extern struct {
-    StartDirectoryEnumerationCallback: PRJ_START_DIRECTORY_ENUMERATION_CB,
-    EndDirectoryEnumerationCallback: PRJ_END_DIRECTORY_ENUMERATION_CB,
-    GetDirectoryEnumerationCallback: PRJ_GET_DIRECTORY_ENUMERATION_CB,
-    GetPlaceholderInfoCallback: PRJ_GET_PLACEHOLDER_INFO_CB,
-    GetFileDataCallback: PRJ_GET_FILE_DATA_CB,
+    StartDirectoryEnumerationCallback: *const fn (*const PRJ_CALLBACK_DATA, *const GUID) callconv(.winapi) HRESULT,
+    EndDirectoryEnumerationCallback: *const fn (*const PRJ_CALLBACK_DATA, *const GUID) callconv(.winapi) HRESULT,
+    GetDirectoryEnumerationCallback: *const fn (*const PRJ_CALLBACK_DATA, *const GUID, ?[*:0]const u16, ?*anyopaque) callconv(.winapi) HRESULT,
+    GetPlaceholderInfoCallback: *const fn (*const PRJ_CALLBACK_DATA) callconv(.winapi) HRESULT,
+    GetFileDataCallback: *const fn (*const PRJ_CALLBACK_DATA, u64, u32) callconv(.winapi) HRESULT,
     QueryFileNameCallback: ?*anyopaque = null,
-    NotificationCallback: ?*anyopaque = null,
+    NotificationCallback: ?*const fn (*const PRJ_CALLBACK_DATA, u8, u32, ?[*:0]const u16, *PRJ_NOTIFICATION_PARAMETERS) callconv(.winapi) HRESULT = null,
     CancelCommandCallback: ?*anyopaque = null,
 };
 
-extern "kernel32" fn LoadLibraryA(lpLibFileName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn FreeLibrary(hLibModule: ?*anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn GetProcAddress(hModule: ?*anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
-extern "kernel32" fn AcquireSRWLockExclusive(SRWLock: *anyopaque) callconv(.winapi) void;
-extern "kernel32" fn ReleaseSRWLockExclusive(SRWLock: *anyopaque) callconv(.winapi) void;
+const PrjApi = struct {
+    StartVirtualizing: *const fn ([*:0]const u16, *const PRJ_CALLBACKS, ?*const anyopaque, ?*const PRJ_START_VIRTUALIZING_OPTIONS, *?*anyopaque) callconv(.winapi) HRESULT,
+    StopVirtualizing: *const fn (?*anyopaque) callconv(.winapi) void,
+    MarkDirectoryAsPlaceholder: *const fn ([*:0]const u16, ?[*:0]const u16, ?*const anyopaque, *const GUID) callconv(.winapi) HRESULT,
+    FillDirEntryBuffer: *const fn ([*:0]const u16, *const PRJ_FILE_BASIC_INFO, ?*anyopaque) callconv(.winapi) HRESULT,
+    WriteFileData: *const fn (?*anyopaque, *const GUID, *const anyopaque, u64, u32) callconv(.winapi) HRESULT,
+    WritePlaceholderInfo: *const fn (?*anyopaque, [*:0]const u16, *const PRJ_PLACEHOLDER_INFO, u32) callconv(.winapi) HRESULT,
+    FileNameMatch: *const fn ([*:0]const u16, [*:0]const u16) callconv(.winapi) bool,
+    FileNameCompare: *const fn ([*:0]const u16, [*:0]const u16) callconv(.winapi) i32,
 
-const FnPrjStartVirtualizing = *const fn (
-    [*:0]const u16,
-    *const PRJ_CALLBACKS,
-    ?*const anyopaque,
-    ?*const anyopaque,
-    *?*anyopaque,
-) callconv(.winapi) HRESULT;
-
-const FnPrjStopVirtualizing = *const fn (?*anyopaque) callconv(.winapi) void;
-
-const FnPrjMarkDirectoryAsPlaceholder = *const fn (
-    [*:0]const u16,
-    ?[*:0]const u16,
-    ?*const anyopaque,
-    *const GUID,
-) callconv(.winapi) HRESULT;
-
-const FnPrjFillDirEntryBuffer = *const fn (
-    [*:0]const u16,
-    *const PRJ_FILE_BASIC_INFO,
-    ?*anyopaque,
-) callconv(.winapi) HRESULT;
-
-const FnPrjWriteFileData = *const fn (
-    ?*anyopaque,
-    *const GUID,
-    *const anyopaque,
-    u64,
-    u32,
-) callconv(.winapi) HRESULT;
-
-const FnPrjWritePlaceholderInfo = *const fn (
-    ?*anyopaque,
-    [*:0]const u16,
-    *const PRJ_PLACEHOLDER_INFO,
-    u32,
-) callconv(.winapi) HRESULT;
-
-const FnPrjFileNameMatch = *const fn ([*:0]const u16, [*:0]const u16) callconv(.winapi) bool;
-const FnPrjFileNameCompare = *const fn ([*:0]const u16, [*:0]const u16) callconv(.winapi) i32;
-
-const Api = struct {
-    handle: *anyopaque,
-    PrjStartVirtualizing: FnPrjStartVirtualizing,
-    PrjStopVirtualizing: FnPrjStopVirtualizing,
-    PrjMarkDirectoryAsPlaceholder: FnPrjMarkDirectoryAsPlaceholder,
-    PrjFillDirEntryBuffer: FnPrjFillDirEntryBuffer,
-    PrjWriteFileData: FnPrjWriteFileData,
-    PrjWritePlaceholderInfo: FnPrjWritePlaceholderInfo,
-    PrjFileNameMatch: FnPrjFileNameMatch,
-    PrjFileNameCompare: FnPrjFileNameCompare,
-
-    fn load() !Api {
-        const h = LoadLibraryA("ProjectedFSLib.dll") orelse return error.ProjFsNotAvailable;
-
-        const Cast = struct {
-            inline fn fnPtr(comptime T: type, handle: *anyopaque, name: [*:0]const u8) !T {
-                const p = GetProcAddress(handle, name) orelse return error.SymbolNotFound;
-                return @ptrCast(@alignCast(p));
-            }
-        };
-
-        return Api{
-            .handle = h,
-            .PrjStartVirtualizing = try Cast.fnPtr(FnPrjStartVirtualizing, h, "PrjStartVirtualizing"),
-            .PrjStopVirtualizing = try Cast.fnPtr(FnPrjStopVirtualizing, h, "PrjStopVirtualizing"),
-            .PrjMarkDirectoryAsPlaceholder = try Cast.fnPtr(FnPrjMarkDirectoryAsPlaceholder, h, "PrjMarkDirectoryAsPlaceholder"),
-            .PrjFillDirEntryBuffer = try Cast.fnPtr(FnPrjFillDirEntryBuffer, h, "PrjFillDirEntryBuffer"),
-            .PrjWriteFileData = try Cast.fnPtr(FnPrjWriteFileData, h, "PrjWriteFileData"),
-            .PrjWritePlaceholderInfo = try Cast.fnPtr(FnPrjWritePlaceholderInfo, h, "PrjWritePlaceholderInfo"),
-            .PrjFileNameMatch = try Cast.fnPtr(FnPrjFileNameMatch, h, "PrjFileNameMatch"),
-            .PrjFileNameCompare = try Cast.fnPtr(FnPrjFileNameCompare, h, "PrjFileNameCompare"),
+    fn load() !PrjApi {
+        const h = LoadLibraryA("ProjectedFSLib.dll") orelse return error.ProjFsUnavailable;
+        return .{
+            .StartVirtualizing = @ptrCast(GetProcAddress(h, "PrjStartVirtualizing") orelse return error.SymbolMissing),
+            .StopVirtualizing = @ptrCast(GetProcAddress(h, "PrjStopVirtualizing") orelse return error.SymbolMissing),
+            .MarkDirectoryAsPlaceholder = @ptrCast(GetProcAddress(h, "PrjMarkDirectoryAsPlaceholder") orelse return error.SymbolMissing),
+            .FillDirEntryBuffer = @ptrCast(GetProcAddress(h, "PrjFillDirEntryBuffer") orelse return error.SymbolMissing),
+            .WriteFileData = @ptrCast(GetProcAddress(h, "PrjWriteFileData") orelse return error.SymbolMissing),
+            .WritePlaceholderInfo = @ptrCast(GetProcAddress(h, "PrjWritePlaceholderInfo") orelse return error.SymbolMissing),
+            .FileNameMatch = @ptrCast(GetProcAddress(h, "PrjFileNameMatch") orelse return error.SymbolMissing),
+            .FileNameCompare = @ptrCast(GetProcAddress(h, "PrjFileNameCompare") orelse return error.SymbolMissing),
         };
     }
 };
 
-extern "kernel32" fn GetFullPathNameW(
-    lpFileName: [*:0]const u16,
-    nBufferLength: u32,
-    lpBuffer: [*]u16,
-    lpFilePart: ?*?*anyopaque,
-) callconv(.winapi) u32;
-
-extern "kernel32" fn CreateEventA(
-    lpEventAttributes: ?*anyopaque,
-    bManualReset: i32,
-    bInitialState: i32,
-    lpName: ?[*:0]const u8,
-) callconv(.winapi) ?*anyopaque;
-
-extern "kernel32" fn SetEvent(hEvent: ?*anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn WaitForSingleObject(hHandle: ?*anyopaque, dwMilliseconds: u32) callconv(.winapi) u32;
-extern "kernel32" fn SetConsoleCtrlHandler(
-    HandlerRoutine: ?*const fn (u32) callconv(.winapi) i32,
-    Add: i32,
-) callconv(.winapi) i32;
-
-const INFINITE: u32 = 0xFFFFFFFF;
+extern "kernel32" fn LoadLibraryA([*:0]const u8) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetProcAddress(?*anyopaque, [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+extern "kernel32" fn GetFullPathNameW([*:0]const u16, u32, [*]u16, ?*?*anyopaque) callconv(.winapi) u32;
+extern "kernel32" fn CreateEventA(?*anyopaque, i32, i32, ?[*:0]const u8) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn SetEvent(?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn CloseHandle(?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn WaitForSingleObject(?*anyopaque, u32) callconv(.winapi) u32;
+extern "kernel32" fn SetConsoleCtrlHandler(?*const fn (u32) callconv(.winapi) i32, i32) callconv(.winapi) i32;
+extern "kernel32" fn AcquireSRWLockExclusive(*anyopaque) callconv(.winapi) void;
+extern "kernel32" fn ReleaseSRWLockExclusive(*anyopaque) callconv(.winapi) void;
 
 const DirItem = struct {
     name_w: [260:0]u16,
@@ -212,244 +148,299 @@ const DirItem = struct {
     size: u64,
 };
 
-const EnumSession = struct {
-    items: std.ArrayList(DirItem),
+const Session = struct {
+    id: GUID,
+    items: []DirItem,
     cursor: usize,
-    pattern: [260:0]u16,
-    pattern_set: bool,
 };
 
-const Mutex = struct {
-    srw: ?*anyopaque = null,
-    pub fn lock(self: *Mutex) void {
-        AcquireSRWLockExclusive(@ptrCast(&self.srw));
-    }
-    pub fn unlock(self: *Mutex) void {
-        ReleaseSRWLockExclusive(@ptrCast(&self.srw));
-    }
+pub const MountCallbacks = struct {
+    find_fn: *const fn (*anyopaque, []const u8) ?EntryInfo,
+    read_fn: *const fn (*const anyopaque, u32, u64, []u8) usize,
+    entries_fn: *const fn (*const anyopaque, usize) ?DirEntryInfo,
+    on_file_write_fn: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+    on_file_delete_fn: *const fn (*anyopaque, []const u8) anyerror!void,
 };
 
-const Context = struct {
-    fs: *DefaultFs,
+const MountState = struct {
+    archive: *anyopaque,
     allocator: std.mem.Allocator,
-    root_path: []const u8,
-    sessions: std.AutoHashMap(GUID, EnumSession),
-    mutex: Mutex = .{},
+    mount_dir: []const u8,
+    callbacks: MountCallbacks,
+    sessions: [16]?Session = [_]?Session{null} ** 16,
+    lock: ?*anyopaque = null,
 };
 
-var global_ctx: Context = undefined;
-var api: Api = undefined;
-var global_shutdown_event: ?*anyopaque = null;
+var state: MountState = undefined;
+var prj: PrjApi = undefined;
+var shutdown_event: ?*anyopaque = null;
 
-fn ctrlHandler(_: u32) callconv(.winapi) i32 {
-    if (global_shutdown_event) |event| {
-        _ = SetEvent(event);
-        return 1;
-    }
-    return 0;
-}
-
-fn u16ToUtf8(out: []u8, maybe_src: ?[*:0]const u16) []const u8 {
-    const src = maybe_src orelse return "";
+fn toUtf8(out: []u8, src: ?[*:0]const u16) []const u8 {
+    const s = src orelse return "";
     var len: usize = 0;
-    while (src[len] != 0) : (len += 1) {}
-    const end = std.unicode.utf16LeToUtf8(out, src[0..len]) catch 0;
-    for (out[0..end]) |*b| {
-        if (b.* == '\\') b.* = '/';
-    }
-    return out[0..end];
+    while (s[len] != 0) : (len += 1) {}
+    const n = std.unicode.utf16LeToUtf8(out, s[0..len]) catch 0;
+    for (out[0..n]) |*b| if (b.* == '\\') {
+        b.* = '/';
+    };
+    return out[0..n];
 }
 
-fn isVirtualDirectory(dir_path: []const u8) bool {
-    if (dir_path.len == 0) return true;
-    for (global_ctx.fs.entries.items) |entry| {
-        if (entry.path.len > dir_path.len and
-            std.mem.startsWith(u8, entry.path, dir_path) and
-            entry.path[dir_path.len] == '/')
-        {
-            return true;
-        }
+fn isDir(dir: []const u8) bool {
+    if (dir.len == 0) return true;
+    var idx: usize = 0;
+    while (state.callbacks.entries_fn(state.archive, idx)) |e| : (idx += 1) {
+        if (e.path.len > dir.len and std.mem.startsWith(u8, e.path, dir) and e.path[dir.len] == '/') return true;
     }
     return false;
 }
 
+fn readRangeWalk(buffer: anytype, id: u32, skip: *u64, dest: []u8, written: *usize) void {
+    if (written.* >= dest.len) return;
+    if ((id & 0x8000_0000) != 0) {
+        const pair = buffer.readPair(id);
+        readRangeWalk(buffer, pair[0], skip, dest, written);
+        readRangeWalk(buffer, pair[1], skip, dest, written);
+    } else {
+        const slice = buffer.readBytes(id);
+        if (skip.* >= slice.len) {
+            skip.* -= slice.len;
+            return;
+        }
+        const chunk = slice[skip.*..];
+        skip.* = 0;
+        const n = @min(dest.len - written.*, chunk.len);
+        @memcpy(dest[written.*..][0..n], chunk[0..n]);
+        written.* += n;
+    }
+}
+
 fn onStartDir(data: *const PRJ_CALLBACK_DATA, id: *const GUID) callconv(.winapi) HRESULT {
-    global_ctx.mutex.lock();
-    defer global_ctx.mutex.unlock();
+    AcquireSRWLockExclusive(@ptrCast(&state.lock));
+    defer ReleaseSRWLockExclusive(@ptrCast(&state.lock));
 
     var path_buf: [512]u8 = undefined;
-    const dir_path = u16ToUtf8(&path_buf, data.FilePathName);
+    const dir = toUtf8(&path_buf, data.FilePathName);
 
-    var session = EnumSession{
-        .items = std.ArrayList(DirItem).initCapacity(global_ctx.allocator, 16) catch return E_INSUFFICIENT_BUFFER,
-        .cursor = 0,
-        .pattern = undefined,
-        .pattern_set = false,
-    };
-    errdefer session.items.deinit(global_ctx.allocator);
+    var list: std.ArrayListUnmanaged(DirItem) = .empty;
+    defer list.deinit(state.allocator);
 
-    var seen_dirs = std.StringHashMap(void).init(global_ctx.allocator);
-    defer seen_dirs.deinit();
+    var idx: usize = 0;
+    while (state.callbacks.entries_fn(state.archive, idx)) |e| : (idx += 1) {
+        const rel = if (dir.len == 0) e.path else if (std.mem.startsWith(u8, e.path, dir) and e.path.len > dir.len and e.path[dir.len] == '/') e.path[dir.len + 1 ..] else continue;
+        const slash = std.mem.indexOfScalar(u8, rel, '/');
+        const name = if (slash) |s| rel[0..s] else rel;
+        const item_is_dir = (slash != null);
 
-    for (global_ctx.fs.entries.items) |entry| {
-        const rel = if (dir_path.len == 0)
-            entry.path
-        else if (std.mem.startsWith(u8, entry.path, dir_path) and
-            entry.path.len > dir_path.len and
-            entry.path[dir_path.len] == '/')
-            entry.path[dir_path.len + 1 ..]
-        else
-            continue;
-
-        if (std.mem.indexOfScalar(u8, rel, '/')) |slash| {
-            const sub = rel[0..slash];
-            if (!seen_dirs.contains(sub)) {
-                seen_dirs.put(sub, {}) catch continue;
-                var item = DirItem{ .name_w = undefined, .is_dir = true, .size = 0 };
-                const u16_len = std.unicode.utf8ToUtf16Le(&item.name_w, sub) catch continue;
-                item.name_w[u16_len] = 0;
-                session.items.append(global_ctx.allocator, item) catch continue;
+        var exists = false;
+        for (list.items) |it| {
+            var buf: [260]u8 = undefined;
+            const existing_name = toUtf8(&buf, &it.name_w);
+            if (std.mem.eql(u8, existing_name, name)) {
+                exists = true;
+                break;
             }
-        } else {
-            var item = DirItem{ .name_w = undefined, .is_dir = false, .size = entry.size };
-            const u16_len = std.unicode.utf8ToUtf16Le(&item.name_w, rel) catch continue;
-            item.name_w[u16_len] = 0;
-            session.items.append(global_ctx.allocator, item) catch continue;
         }
+        if (exists) continue;
+
+        var it = DirItem{ .name_w = undefined, .is_dir = item_is_dir, .size = if (item_is_dir) 0 else e.size };
+        const u16_len = std.unicode.utf8ToUtf16Le(&it.name_w, name) catch continue;
+        it.name_w[u16_len] = 0;
+        list.append(state.allocator, it) catch return E_INSUFFICIENT_BUFFER;
     }
 
     const Sorter = struct {
-        fn lessThan(_: void, a: DirItem, b: DirItem) bool {
-            return api.PrjFileNameCompare(&a.name_w, &b.name_w) < 0;
+        fn cmp(_: void, a: DirItem, b: DirItem) bool {
+            return prj.FileNameCompare(&a.name_w, &b.name_w) < 0;
         }
     };
-    std.mem.sort(DirItem, session.items.items, {}, Sorter.lessThan);
+    std.mem.sort(DirItem, list.items, {}, Sorter.cmp);
 
-    global_ctx.sessions.put(id.*, session) catch return E_INSUFFICIENT_BUFFER;
-    return S_OK;
+    for (&state.sessions) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{
+                .id = id.*,
+                .items = list.toOwnedSlice(state.allocator) catch return E_INSUFFICIENT_BUFFER,
+                .cursor = 0,
+            };
+            return S_OK;
+        }
+    }
+    return E_INSUFFICIENT_BUFFER;
 }
 
 fn onEndDir(_: *const PRJ_CALLBACK_DATA, id: *const GUID) callconv(.winapi) HRESULT {
-    global_ctx.mutex.lock();
-    defer global_ctx.mutex.unlock();
+    AcquireSRWLockExclusive(@ptrCast(&state.lock));
+    defer ReleaseSRWLockExclusive(@ptrCast(&state.lock));
 
-    if (global_ctx.sessions.fetchRemove(id.*)) |kv| {
-        var s = kv.value;
-        s.items.deinit(global_ctx.allocator);
+    for (&state.sessions) |*slot| {
+        if (slot.*) |s| {
+            if (std.mem.eql(u8, std.mem.asBytes(&s.id), std.mem.asBytes(id))) {
+                state.allocator.free(s.items);
+                slot.* = null;
+                return S_OK;
+            }
+        }
     }
     return S_OK;
 }
 
-fn onGetDir(
-    data: *const PRJ_CALLBACK_DATA,
-    id: *const GUID,
-    searchExpr: ?[*:0]const u16,
-    dirBuffer: ?*anyopaque,
-) callconv(.winapi) HRESULT {
-    global_ctx.mutex.lock();
-    defer global_ctx.mutex.unlock();
+fn onGetDir(data: *const PRJ_CALLBACK_DATA, id: *const GUID, search: ?[*:0]const u16, buf: ?*anyopaque) callconv(.winapi) HRESULT {
+    AcquireSRWLockExclusive(@ptrCast(&state.lock));
+    defer ReleaseSRWLockExclusive(@ptrCast(&state.lock));
 
-    const session = global_ctx.sessions.getPtr(id.*) orelse return E_FILENOTFOUND;
-
-    const restart = (data.Flags & 1) != 0;
-    if (!session.pattern_set or restart) {
-        session.cursor = 0;
-        if (searchExpr) |expr| {
-            var i: usize = 0;
-            while (expr[i] != 0 and i < 259) : (i += 1) {
-                session.pattern[i] = expr[i];
+    var s_ptr: ?*Session = null;
+    for (&state.sessions) |*slot| {
+        if (slot.*) |*s| {
+            if (std.mem.eql(u8, std.mem.asBytes(&s.id), std.mem.asBytes(id))) {
+                s_ptr = s;
+                break;
             }
-            session.pattern[i] = 0;
-        } else {
-            session.pattern[0] = '*';
-            session.pattern[1] = 0;
         }
-        session.pattern_set = true;
     }
+    const session = s_ptr orelse return E_FILENOTFOUND;
+    if ((data.Flags & 1) != 0) session.cursor = 0;
 
-    var added: usize = 0;
-    while (session.cursor < session.items.items.len) {
-        const it = &session.items.items[session.cursor];
+    var pattern_buf: [260:0]u16 = undefined;
+    const pattern: [*:0]const u16 = if (search) |p| p else blk: {
+        pattern_buf[0] = '*';
+        pattern_buf[1] = 0;
+        break :blk &pattern_buf;
+    };
 
-        if (api.PrjFileNameMatch(&it.name_w, &session.pattern)) {
-            const info = PRJ_FILE_BASIC_INFO{
-                .IsDirectory = if (it.is_dir) 1 else 0,
-                .FileSize = if (it.is_dir) 0 else @intCast(it.size),
-                .FileAttributes = if (it.is_dir) 0x10 else 0x80,
-            };
+    while (session.cursor < session.items.len) : (session.cursor += 1) {
+        const it = &session.items[session.cursor];
+        if (!prj.FileNameMatch(&it.name_w, pattern)) continue;
 
-            const fill_hr = api.PrjFillDirEntryBuffer(&it.name_w, &info, dirBuffer);
-            if (fill_hr == E_INSUFFICIENT_BUFFER) {
-                return if (added == 0) E_INSUFFICIENT_BUFFER else S_OK;
-            }
-            added += 1;
-        }
-        session.cursor += 1;
+        const info = PRJ_FILE_BASIC_INFO{
+            .IsDirectory = if (it.is_dir) 1 else 0,
+            .FileSize = if (it.is_dir) 0 else @intCast(it.size),
+            .FileAttributes = if (it.is_dir) 0x10 else 0x80,
+        };
+        if (prj.FillDirEntryBuffer(&it.name_w, &info, buf) == E_INSUFFICIENT_BUFFER) return S_OK;
     }
-
     return S_OK;
 }
 
 fn onGetPlaceholder(data: *const PRJ_CALLBACK_DATA) callconv(.winapi) HRESULT {
     var path_buf: [512]u8 = undefined;
-    const path = u16ToUtf8(&path_buf, data.FilePathName);
+    const path = toUtf8(&path_buf, data.FilePathName);
 
     var info = std.mem.zeroes(PRJ_PLACEHOLDER_INFO);
-
-    if (global_ctx.fs.findEntry(path)) |entry| {
+    if (state.callbacks.find_fn(state.archive, path)) |entry| {
         info.FileBasicInfo.IsDirectory = 0;
         info.FileBasicInfo.FileSize = @intCast(entry.size);
         info.FileBasicInfo.FileAttributes = 0x80;
-    } else if (isVirtualDirectory(path)) {
+    } else if (isDir(path)) {
         info.FileBasicInfo.IsDirectory = 1;
-        info.FileBasicInfo.FileSize = 0;
         info.FileBasicInfo.FileAttributes = 0x10;
-    } else {
-        return E_FILENOTFOUND;
-    }
+    } else return E_FILENOTFOUND;
 
-    const path_name = data.FilePathName orelse return E_FILENOTFOUND;
-    return api.PrjWritePlaceholderInfo(
-        data.NamespaceVirtualizationContext,
-        path_name,
-        &info,
-        @sizeOf(PRJ_PLACEHOLDER_INFO),
-    );
+    return prj.WritePlaceholderInfo(data.NamespaceVirtualizationContext, data.FilePathName.?, &info, @sizeOf(PRJ_PLACEHOLDER_INFO));
 }
 
-fn onGetFileData(
+fn onGetFileData(data: *const PRJ_CALLBACK_DATA, offset: u64, len: u32) callconv(.winapi) HRESULT {
+    var path_buf: [512]u8 = undefined;
+    const path = toUtf8(&path_buf, data.FilePathName);
+
+    const entry = state.callbacks.find_fn(state.archive, path) orelse return E_FILENOTFOUND;
+    const buf = state.allocator.alloc(u8, len) catch return E_INSUFFICIENT_BUFFER;
+    defer state.allocator.free(buf);
+
+    const n = state.callbacks.read_fn(state.archive, entry.root, offset, buf);
+    return prj.WriteFileData(data.NamespaceVirtualizationContext, &data.DataStreamId, buf.ptr, offset, @intCast(n));
+}
+
+fn onNotification(
     data: *const PRJ_CALLBACK_DATA,
-    byteOffset: u64,
-    length: u32,
+    _: u8,
+    notification: u32,
+    _: ?[*:0]const u16,
+    _: *PRJ_NOTIFICATION_PARAMETERS,
 ) callconv(.winapi) HRESULT {
     var path_buf: [512]u8 = undefined;
-    const path = u16ToUtf8(&path_buf, data.FilePathName);
+    const rel_path = toUtf8(&path_buf, data.FilePathName);
+    if (rel_path.len == 0) return S_OK;
 
-    const file_buf = global_ctx.allocator.alloc(u8, length) catch return E_INSUFFICIENT_BUFFER;
-    defer global_ctx.allocator.free(file_buf);
+    AcquireSRWLockExclusive(@ptrCast(&state.lock));
+    defer ReleaseSRWLockExclusive(@ptrCast(&state.lock));
 
-    const bytes_read = global_ctx.fs.read(global_ctx.allocator, path, byteOffset, file_buf) catch {
-        return E_FILENOTFOUND;
-    };
+    if ((notification & (PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED | PRJ_NOTIFY_NEW_FILE_CREATED | PRJ_NOTIFY_FILE_OVERWRITTEN)) != 0) {
+        var full_buf: [1024]u8 = undefined;
+        const full_path = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ state.mount_dir, rel_path }) catch return S_OK;
+        state.callbacks.on_file_write_fn(state.archive, rel_path, full_path) catch {};
+    } else if ((notification & PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED) != 0) {
+        state.callbacks.on_file_delete_fn(state.archive, rel_path) catch {};
+    }
+    return S_OK;
+}
 
-    return api.PrjWriteFileData(
-        data.NamespaceVirtualizationContext,
-        &data.DataStreamId,
-        file_buf.ptr,
-        byteOffset,
-        @intCast(bytes_read),
-    );
+fn ctrlHandler(_: u32) callconv(.winapi) i32 {
+    if (shutdown_event) |e| _ = SetEvent(e);
+    return 1;
 }
 
 pub fn mount(
     allocator: std.mem.Allocator,
-    fs: *DefaultFs,
+    archive: anytype,
     root_path: []const u8,
+    on_write: anytype,
+    on_delete: anytype,
 ) !void {
     if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
 
-    api = try Api.load();
-    defer _ = FreeLibrary(api.handle);
+    prj = try PrjApi.load();
+
+    const ArchiveType = @TypeOf(archive.*);
+    const WriteFn = *const fn (*ArchiveType, []const u8, []const u8) anyerror!void;
+    const DeleteFn = *const fn (*ArchiveType, []const u8) anyerror!void;
+
+    const Helper = struct {
+        var write_ctx: WriteFn = undefined;
+        var delete_ctx: DeleteFn = undefined;
+
+        fn find(ctx: *anyopaque, path: []const u8) ?EntryInfo {
+            const a: *ArchiveType = @ptrCast(@alignCast(ctx));
+            const e = a.find(path) orelse return null;
+            return .{ .root = e.root, .size = e.size };
+        }
+        fn read(ctx: *const anyopaque, root: u32, offset: u64, dest: []u8) usize {
+            const a: *const ArchiveType = @ptrCast(@alignCast(ctx));
+            var skip = offset;
+            var written: usize = 0;
+            readRangeWalk(&a.buffer, root, &skip, dest, &written);
+            return written;
+        }
+        fn entryAt(ctx: *const anyopaque, idx: usize) ?DirEntryInfo {
+            const a: *const ArchiveType = @ptrCast(@alignCast(ctx));
+            if (idx >= a.entries.items.len) return null;
+            const e = a.entries.items[idx];
+            return .{ .path = e.path, .size = e.size };
+        }
+        fn onWrite(ctx: *anyopaque, rel_path: []const u8, full_path: []const u8) anyerror!void {
+            const a: *ArchiveType = @ptrCast(@alignCast(ctx));
+            try write_ctx(a, rel_path, full_path);
+        }
+        fn onDelete(ctx: *anyopaque, rel_path: []const u8) anyerror!void {
+            const a: *ArchiveType = @ptrCast(@alignCast(ctx));
+            try delete_ctx(a, rel_path);
+        }
+    };
+    Helper.write_ctx = on_write;
+    Helper.delete_ctx = on_delete;
+
+    state = .{
+        .archive = archive,
+        .allocator = allocator,
+        .mount_dir = root_path,
+        .callbacks = .{
+            .find_fn = Helper.find,
+            .read_fn = Helper.read,
+            .entries_fn = Helper.entryAt,
+            .on_file_write_fn = Helper.onWrite,
+            .on_file_delete_fn = Helper.onDelete,
+        },
+    };
 
     const rel_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, root_path);
     defer allocator.free(rel_w);
@@ -466,8 +457,11 @@ pub fn mount(
         .Data4 = .{ 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67 },
     };
 
-    const mark_hr = api.PrjMarkDirectoryAsPlaceholder(&abs_w, null, null, &guid);
-    if (mark_hr != S_OK and mark_hr != E_ALREADY_EXISTS) return error.PlaceholderMarkFailed;
+    const mark_hr = prj.MarkDirectoryAsPlaceholder(&abs_w, null, null, &guid);
+    if (mark_hr != S_OK and mark_hr != E_ALREADY_EXISTS) {
+        std.debug.print("PrjMarkDirectoryAsPlaceholder failed: 0x{X:0>8}\n", .{@as(u32, @bitCast(mark_hr))});
+        return error.PlaceholderMarkFailed;
+    }
 
     const callbacks = PRJ_CALLBACKS{
         .StartDirectoryEnumerationCallback = onStartDir,
@@ -475,40 +469,39 @@ pub fn mount(
         .GetDirectoryEnumerationCallback = onGetDir,
         .GetPlaceholderInfoCallback = onGetPlaceholder,
         .GetFileDataCallback = onGetFileData,
-        .QueryFileNameCallback = null,
+        .NotificationCallback = onNotification,
     };
 
-    global_ctx = Context{
-        .fs = fs,
-        .allocator = allocator,
-        .root_path = root_path,
-        .sessions = std.AutoHashMap(GUID, EnumSession).init(allocator),
+    const empty_root: [:0]const u16 = &[0:0]u16{};
+    const notif_mask: u32 = PRJ_NOTIFY_NEW_FILE_CREATED |
+        PRJ_NOTIFY_FILE_OVERWRITTEN |
+        PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED |
+        PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED;
+
+    const notif_mapping = [_]PRJ_NOTIFICATION_MAPPING{
+        .{
+            .NotificationBitMask = notif_mask,
+            .NotificationRoot = empty_root.ptr,
+        },
     };
-    defer {
-        var it = global_ctx.sessions.valueIterator();
-        while (it.next()) |s| {
-            s.items.deinit(allocator);
-        }
-        global_ctx.sessions.deinit();
+
+    const options = PRJ_START_VIRTUALIZING_OPTIONS{
+        .NotificationMappings = &notif_mapping,
+        .NotificationMappingsCount = 1,
+    };
+
+    var handle: ?*anyopaque = null;
+    const start_hr = prj.StartVirtualizing(&abs_w, &callbacks, null, &options, &handle);
+    if (start_hr != S_OK) {
+        std.debug.print("PrjStartVirtualizing failed: 0x{X:0>8}\n", .{@as(u32, @bitCast(start_hr))});
+        return error.VirtualizationStartFailed;
     }
+    defer prj.StopVirtualizing(handle);
 
-    var session: ?*anyopaque = null;
-    const start_hr = api.PrjStartVirtualizing(&abs_w, &callbacks, null, null, &session);
-    if (start_hr != S_OK) return error.VirtualizationStartFailed;
-    defer api.PrjStopVirtualizing(session);
-
-    const shutdown_event = CreateEventA(null, 1, 0, null) orelse return error.EventCreationFailed;
+    shutdown_event = CreateEventA(null, 1, 0, null) orelse return error.EventCreationFailed;
     defer _ = CloseHandle(shutdown_event);
-
-    global_shutdown_event = shutdown_event;
-    defer global_shutdown_event = null;
-
     _ = SetConsoleCtrlHandler(ctrlHandler, 1);
     defer _ = SetConsoleCtrlHandler(ctrlHandler, 0);
 
-    std.debug.print("Virtual filesystem mounted on '{s}'. Press Ctrl+C to unmount...\n", .{root_path});
-
-    _ = WaitForSingleObject(shutdown_event, INFINITE);
-
-    std.debug.print("\nUnmounted '{s}'.\n", .{root_path});
+    _ = WaitForSingleObject(shutdown_event, 0xFFFFFFFF);
 }

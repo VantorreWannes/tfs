@@ -10,9 +10,8 @@ Instead of splitting data by fixed block sizes, it uses a rolling hash (FastCDC)
 
 - **Shift-tolerant**: Inserting or deleting bytes does not break deduplication downstream.
 - **Tree-level reuse**: Identical chunk sequences share internal tree nodes, not just raw byte payloads.
-- **Direct seeks**: Reads arbitrary byte offsets in $O(\log N)$ time using node weights, without linear scanning.
 - **Streaming**: Pipes to and from `stdin` and `stdout`.
-- **On-demand mounting**: Mounts archives as read-only directories via Windows ProjFS, reading chunks dynamically without extracting the archive.
+- **On-demand mounting**: Mounts archives as virtual directories via Windows ProjFS, reading chunks dynamically without extracting the archive and indexing newly written files live.
 - **Limitation**: Chunks are stored uncompressed; space savings come purely from deduplication.
 
 ---

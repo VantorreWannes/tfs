@@ -1,7 +1,46 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const tfs = @import("root.zig");
-const projfs = @import("projfs.zig");
+const projfs = if (builtin.os.tag == .windows) @import("projfs.zig") else struct {};
+
+inline fn writeInt(writer: *std.Io.Writer, comptime T: type, val: T) !void {
+    const len = @divExact(@typeInfo(T).int.bits, 8);
+    var b: [len]u8 = undefined;
+    std.mem.writeInt(T, &b, val, .little);
+    try writer.writeAll(&b);
+}
+
+inline fn readInt(reader: *std.Io.Reader, comptime T: type) !T {
+    const len = @divExact(@typeInfo(T).int.bits, 8);
+    var b: [len]u8 = undefined;
+    try reader.readSliceAll(&b);
+    return std.mem.readInt(T, &b, .little);
+}
+
+fn formatTimestamp(nanos: i96, buf: *[32]u8) []const u8 {
+    const total_secs: i64 = @intCast(@divFloor(nanos, std.time.ns_per_s));
+    const days: i64 = @divFloor(total_secs, 86400);
+    const day_secs: i64 = @mod(total_secs, 86400);
+
+    const hours: u32 = @intCast(@divFloor(day_secs, 3600));
+    const minutes: u32 = @intCast(@divFloor(@mod(day_secs, 3600), 60));
+    const seconds: u32 = @intCast(@mod(day_secs, 60));
+
+    const z = days + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: u32 = @intCast(z - era * 146097);
+    const yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y: i64 = @as(i64, yoe) + era * 400;
+    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp: u32 = (5 * doy + 2) / 153;
+    const d: u32 = doy - (153 * mp + 2) / 5 + 1;
+    const m: u32 = if (mp < 10) mp + 3 else mp - 9;
+    const year: i64 = if (m <= 2) y + 1 else y;
+
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC", .{
+        year, m, d, hours, minutes, seconds,
+    }) catch "invalid-time";
+}
 
 pub fn Cli(
     comptime Index: type,
@@ -9,7 +48,153 @@ pub fn Cli(
     comptime IoBufferSize: usize,
 ) type {
     return struct {
-        pub const Fs = tfs.FileSystem(Index, TargetChunkSize);
+        pub const Buffer = tfs.SpanBuffer(Index);
+        pub const Dedup = tfs.ContentIndex(Index);
+
+        pub const Entry = struct {
+            path: []const u8,
+            root: Index,
+            size: u64,
+            timestamp: i96,
+        };
+
+        pub const Archive = struct {
+            const MAGIC = "TFS3";
+
+            buffer: Buffer,
+            entries: std.ArrayListUnmanaged(Entry),
+
+            pub fn init() Archive {
+                return .{
+                    .buffer = Buffer.init(),
+                    .entries = .empty,
+                };
+            }
+
+            pub fn deinit(self: *Archive, allocator: std.mem.Allocator) void {
+                for (self.entries.items) |entry| allocator.free(entry.path);
+                self.entries.deinit(allocator);
+                self.buffer.deinit(allocator);
+            }
+
+            pub fn populateDedup(self: *const Archive, allocator: std.mem.Allocator, dedup: *Dedup) !void {
+                var i: Index = 0;
+                while (i < self.buffer.offsets.items.len) : (i += 1) {
+                    const chunk = self.buffer.readBytes(i);
+                    const hash = std.hash.XxHash64.hash(0, chunk);
+                    try dedup.put(allocator, hash, i);
+                }
+                var p: Index = 0;
+                while (p < self.buffer.pairs.items.len) : (p += 1) {
+                    const id = p | Buffer.FLAG;
+                    const pair = self.buffer.readPair(id);
+                    const hash = (@as(u64, pair[0]) << 32) | pair[1];
+                    try dedup.put(allocator, hash, id);
+                }
+            }
+
+            pub fn load(self: *Archive, io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !void {
+                var stream_buf: [IoBufferSize]u8 = undefined;
+                var reader = file.reader(io, &stream_buf);
+
+                var magic: [4]u8 = undefined;
+                try reader.interface.readSliceAll(&magic);
+                if (!std.mem.eql(u8, &magic, MAGIC)) return error.InvalidArchiveFormat;
+
+                const bytes_len = try readInt(&reader.interface, u32);
+                try self.buffer.bytes.resize(allocator, bytes_len);
+                try reader.interface.readSliceAll(self.buffer.bytes.items);
+
+                const offsets_len = try readInt(&reader.interface, u32);
+                try self.buffer.offsets.resize(allocator, offsets_len);
+                try reader.interface.readSliceAll(std.mem.sliceAsBytes(self.buffer.offsets.items));
+
+                const pairs_len = try readInt(&reader.interface, u32);
+                try self.buffer.pairs.resize(allocator, pairs_len);
+                try reader.interface.readSliceAll(std.mem.sliceAsBytes(self.buffer.pairs.items));
+
+                const entries_len = try readInt(&reader.interface, u32);
+                for (self.entries.items) |entry| allocator.free(entry.path);
+                self.entries.clearRetainingCapacity();
+                try self.entries.ensureTotalCapacity(allocator, entries_len);
+
+                for (0..entries_len) |_| {
+                    const path_len = try readInt(&reader.interface, u16);
+                    const path = try allocator.alloc(u8, path_len);
+                    try reader.interface.readSliceAll(path);
+                    const root = try readInt(&reader.interface, Index);
+                    const size = try readInt(&reader.interface, u64);
+                    const timestamp = try readInt(&reader.interface, i96);
+                    self.entries.appendAssumeCapacity(.{
+                        .path = path,
+                        .root = root,
+                        .size = size,
+                        .timestamp = timestamp,
+                    });
+                }
+            }
+
+            pub fn save(self: *const Archive, io: std.Io, file: std.Io.File) !void {
+                var stream_buf: [IoBufferSize]u8 = undefined;
+                var writer = file.writer(io, &stream_buf);
+
+                try writer.interface.writeAll(MAGIC);
+
+                try writeInt(&writer.interface, u32, @intCast(self.buffer.bytes.items.len));
+                try writer.interface.writeAll(self.buffer.bytes.items);
+
+                try writeInt(&writer.interface, u32, @intCast(self.buffer.offsets.items.len));
+                try writer.interface.writeAll(std.mem.sliceAsBytes(self.buffer.offsets.items));
+
+                try writeInt(&writer.interface, u32, @intCast(self.buffer.pairs.items.len));
+                try writer.interface.writeAll(std.mem.sliceAsBytes(self.buffer.pairs.items));
+
+                try writeInt(&writer.interface, u32, @intCast(self.entries.items.len));
+                for (self.entries.items) |entry| {
+                    try writeInt(&writer.interface, u16, @intCast(entry.path.len));
+                    try writer.interface.writeAll(entry.path);
+                    try writeInt(&writer.interface, Index, entry.root);
+                    try writeInt(&writer.interface, u64, entry.size);
+                    try writeInt(&writer.interface, i96, entry.timestamp);
+                }
+                try writer.interface.flush();
+            }
+
+            pub fn find(self: *const Archive, path: []const u8) ?Entry {
+                var i = self.entries.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (std.mem.eql(u8, self.entries.items[i].path, path)) {
+                        return self.entries.items[i];
+                    }
+                }
+                return null;
+            }
+
+            pub fn put(self: *Archive, allocator: std.mem.Allocator, path: []const u8, root: Index, size: u64, timestamp: i96) !void {
+                const owned_path = try allocator.dupe(u8, path);
+                try self.entries.append(allocator, .{
+                    .path = owned_path,
+                    .root = root,
+                    .size = size,
+                    .timestamp = timestamp,
+                });
+            }
+
+            pub fn remove(self: *Archive, allocator: std.mem.Allocator, path: []const u8) bool {
+                var i = self.entries.items.len;
+                var removed = false;
+                while (i > 0) {
+                    i -= 1;
+                    if (std.mem.eql(u8, self.entries.items[i].path, path)) {
+                        allocator.free(self.entries.items[i].path);
+                        _ = self.entries.swapRemove(i);
+                        removed = true;
+                    }
+                }
+                return removed;
+            }
+        };
 
         pub const Command = enum {
             encode,
@@ -105,18 +290,19 @@ pub fn Cli(
                 try cwd.createDirPath(io, parent);
             }
 
-            var fs = try Fs.init(allocator);
-            defer fs.deinit(allocator);
+            var archive = Archive.init();
+            defer archive.deinit(allocator);
 
             switch (options.command) {
                 .encode => {
                     if (cwd.openFile(io, options.archive_path, .{ .mode = .read_only, .lock = .none })) |archive_file| {
                         defer archive_file.close(io);
-                        try fs.loadFrom(io, allocator, archive_file, true);
+                        try archive.load(io, allocator, archive_file);
                     } else |_| {}
 
-                    try fs.prepareForEncode(allocator, options.entry_name);
-                    const active_path = fs.active_entry.?.path;
+                    var dedup = try Dedup.init(allocator, archive.buffer.offsets.items.len * 2);
+                    defer dedup.deinit(allocator);
+                    try archive.populateDedup(allocator, &dedup);
 
                     const input_path = options.input_path.?;
                     const is_stdin = std.mem.eql(u8, input_path, "-");
@@ -129,27 +315,36 @@ pub fn Cli(
 
                     var stream_buf: [IoBufferSize]u8 = undefined;
                     var reader = input_file.reader(io, &stream_buf);
-                    var read_chunk: [IoBufferSize]u8 = undefined;
 
-                    while (true) {
-                        const bytes_read = try reader.interface.readSliceShort(&read_chunk);
-                        if (bytes_read == 0) break;
-                        try fs.appendSlice(allocator, active_path, read_chunk[0..bytes_read]);
-                    }
+                    const seed: u64 = 0x5EED_0000;
+                    const result = try tfs.streamToIndex(
+                        Index,
+                        TargetChunkSize,
+                        Index,
+                        io,
+                        allocator,
+                        &reader.interface,
+                        seed,
+                        &archive.buffer,
+                        &dedup,
+                    );
+
+                    const timestamp: i96 = std.Io.Clock.now(.real, io).nanoseconds;
+                    try archive.put(allocator, options.entry_name, result.root, result.byte_count, timestamp);
 
                     var archive_output = try cwd.createFile(io, options.archive_path, .{
                         .truncate = true,
                         .lock = .none,
                     });
                     defer archive_output.close(io);
-                    try fs.writeTo(io, allocator, archive_output);
+                    try archive.save(io, archive_output);
                 },
                 .decode => {
                     const archive_file = try cwd.openFile(io, options.archive_path, .{ .mode = .read_only, .lock = .none });
                     defer archive_file.close(io);
-                    try fs.loadFrom(io, allocator, archive_file, false);
+                    try archive.load(io, allocator, archive_file);
 
-                    const file_size = (try fs.size(allocator, options.entry_name)) orelse return error.FileNotFound;
+                    const entry = archive.find(options.entry_name) orelse return error.FileNotFound;
                     const out_path = options.output_path.?;
                     const is_stdout = std.mem.eql(u8, out_path, "-");
 
@@ -168,30 +363,26 @@ pub fn Cli(
                     var stream_buf: [IoBufferSize]u8 = undefined;
                     var writer = output_file.writer(io, &stream_buf);
 
-                    var read_chunk: [IoBufferSize]u8 = undefined;
-                    var offset: u64 = 0;
-
-                    while (offset < file_size) {
-                        const bytes_read = try fs.read(allocator, options.entry_name, offset, &read_chunk);
-                        if (bytes_read == 0) break;
-                        try writer.interface.writeAll(read_chunk[0..bytes_read]);
-                        offset += bytes_read;
-                    }
+                    try tfs.indexToStream(Index, &archive.buffer, entry.root, &writer.interface);
                     try writer.interface.flush();
                 },
                 .list => {
                     const archive_file = try cwd.openFile(io, options.archive_path, .{ .mode = .read_only, .lock = .none });
                     defer archive_file.close(io);
-                    try fs.loadFrom(io, allocator, archive_file, false);
+                    try archive.load(io, allocator, archive_file);
 
                     var stream_buf: [4096]u8 = undefined;
                     var stdout_writer = std.Io.File.stdout().writer(io, &stream_buf);
 
-                    for (fs.entries.items) |entry| {
-                        try stdout_writer.interface.print("{s} (size: {d}, root: {d})\n", .{
+                    var time_buf: [32]u8 = undefined;
+                    for (archive.entries.items, 0..) |entry, i| {
+                        const formatted_time = formatTimestamp(entry.timestamp, &time_buf);
+                        try stdout_writer.interface.print("[{d}] {s} (size: {d}, root: {d}, time: {s})\n", .{
+                            i,
                             entry.path,
                             entry.size,
-                            entry.root.raw(),
+                            entry.root,
+                            formatted_time,
                         });
                     }
                     try stdout_writer.interface.flush();
@@ -202,83 +393,89 @@ pub fn Cli(
                         return error.UnsupportedPlatform;
                     }
 
-                    var archive_existed = false;
                     if (cwd.openFile(io, options.archive_path, .{ .mode = .read_only, .lock = .none })) |archive_file| {
                         defer archive_file.close(io);
-                        try fs.loadFrom(io, allocator, archive_file, false);
-                        archive_existed = true;
-                    } else |err| switch (err) {
-                        error.FileNotFound => {
-                            std.debug.print("Archive '{s}' does not exist. Creating new archive...\n", .{options.archive_path});
-                        },
-                        else => return err,
-                    }
-
-                    const mount_dir = options.output_path.?;
-                    try cwd.createDirPath(io, mount_dir);
-
-                    try projfs.mount(allocator, &fs, mount_dir);
-
-                    var new_count: usize = 0;
-                    if (cwd.openDir(io, mount_dir, .{ .iterate = true })) |mut_dir| {
-                        var dir = mut_dir;
-                        defer dir.close(io);
-
-                        var walker = try dir.walk(allocator);
-                        defer walker.deinit();
-
-                        while (try walker.next(io)) |entry| {
-                            if (entry.kind != .file) continue;
-
-                            var norm_buf: [512]u8 = undefined;
-                            const norm_len = @min(norm_buf.len, entry.path.len);
-                            for (entry.path[0..norm_len], 0..) |c, idx| {
-                                norm_buf[idx] = if (c == '\\') '/' else c;
-                            }
-                            const rel_name = norm_buf[0..norm_len];
-
-                            if (fs.findEntry(rel_name) == null) {
-                                std.debug.print("Saving new file: {s}...\n", .{rel_name});
-                                try fs.prepareForEncode(allocator, rel_name);
-                                const active_path = fs.active_entry.?.path;
-
-                                var disk_file = try dir.openFile(io, entry.path, .{ .mode = .read_only, .lock = .none });
-                                defer disk_file.close(io);
-
-                                var stream_buf: [IoBufferSize]u8 = undefined;
-                                var reader = disk_file.reader(io, &stream_buf);
-                                var read_chunk: [IoBufferSize]u8 = undefined;
-
-                                while (true) {
-                                    const n = try reader.interface.readSliceShort(&read_chunk);
-                                    if (n == 0) break;
-                                    try fs.appendSlice(allocator, active_path, read_chunk[0..n]);
-                                }
-                                new_count += 1;
-                            }
-                        }
-
-                        if (new_count > 0 or archive_existed) {
-                            var it = dir.iterate();
-                            while (try it.next(io)) |entry| {
-                                if (entry.kind == .directory) {
-                                    dir.deleteTree(io, entry.name) catch {};
-                                } else {
-                                    dir.deleteFile(io, entry.name) catch {};
-                                }
-                            }
-                        }
+                        try archive.load(io, allocator, archive_file);
                     } else |_| {}
 
-                    if (archive_existed or new_count > 0) {
-                        var archive_output = try cwd.createFile(io, options.archive_path, .{
-                            .truncate = true,
-                            .lock = .none,
-                        });
-                        defer archive_output.close(io);
-                        try fs.writeTo(io, allocator, archive_output);
-                        std.debug.print("Persisted archive '{s}' ({d} new files).\n", .{ options.archive_path, new_count });
-                    }
+                    var dedup = try Dedup.init(allocator, archive.buffer.offsets.items.len * 2);
+                    defer dedup.deinit(allocator);
+                    try archive.populateDedup(allocator, &dedup);
+
+                    const mount_dir = options.output_path orelse return error.MissingMountFolder;
+                    try cwd.createDirPath(io, mount_dir);
+
+                    const State = struct {
+                        var g_io: std.Io = undefined;
+                        var g_allocator: std.mem.Allocator = undefined;
+                        var g_dedup: *Dedup = undefined;
+                        var g_dirty: bool = false;
+
+                        fn onFileWrite(a: *Archive, rel_path: []const u8, full_path: []const u8) anyerror!void {
+                            var file = std.Io.Dir.cwd().openFile(g_io, full_path, .{ .mode = .read_only, .lock = .none }) catch return;
+                            defer file.close(g_io);
+
+                            var s_buf: [IoBufferSize]u8 = undefined;
+                            var r = file.reader(g_io, &s_buf);
+
+                            const seed: u64 = 0x5EED_0000;
+                            const res = try tfs.streamToIndex(
+                                Index,
+                                TargetChunkSize,
+                                Index,
+                                g_io,
+                                g_allocator,
+                                &r.interface,
+                                seed,
+                                &a.buffer,
+                                g_dedup,
+                            );
+
+                            const timestamp: i96 = std.Io.Clock.now(.real, g_io).nanoseconds;
+                            try a.put(g_allocator, rel_path, res.root, res.byte_count, timestamp);
+                            g_dirty = true;
+
+                            std.debug.print("[live] + {s} ({d} bytes, root: {d})\n", .{ rel_path, res.byte_count, res.root });
+                        }
+
+                        fn onFileDelete(a: *Archive, rel_path: []const u8) anyerror!void {
+                            if (a.remove(g_allocator, rel_path)) {
+                                g_dirty = true;
+                                std.debug.print("[live] - {s}\n", .{rel_path});
+                            }
+                        }
+                    };
+
+                    State.g_io = io;
+                    State.g_allocator = allocator;
+                    State.g_dedup = &dedup;
+
+                    std.debug.print("====================================================\n", .{});
+                    std.debug.print(" Mounted '{s}' on '{s}' ({d} entries)\n", .{
+                        options.archive_path,
+                        mount_dir,
+                        archive.entries.items.len,
+                    });
+                    std.debug.print(" Live FastCDC tree indexing active.\n", .{});
+                    std.debug.print(" Press Ctrl+C to unmount.\n", .{});
+                    std.debug.print("====================================================\n", .{});
+
+                    try projfs.mount(allocator, &archive, mount_dir, State.onFileWrite, State.onFileDelete);
+
+                    std.debug.print("\n[unmount] Stopping virtualization...\n", .{});
+
+                    std.debug.print("[unmount] Writing archive to '{s}'...\n", .{options.archive_path});
+                    var archive_output = try cwd.createFile(io, options.archive_path, .{
+                        .truncate = true,
+                        .lock = .none,
+                    });
+                    defer archive_output.close(io);
+                    try archive.save(io, archive_output);
+
+                    std.debug.print("[unmount] Done. Total entries: {d}, total bytes indexed: {d}.\n", .{
+                        archive.entries.items.len,
+                        archive.buffer.bytes.items.len,
+                    });
                 },
             }
         }
@@ -291,7 +488,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     const args = try init.minimal.args.toSlice(arena);
-    const App = Cli(u32, 64, 131072);
+    const App = Cli(u32, 4096, 131072);
 
     const options = App.Options.parse(args) catch {
         try App.printUsage(io);
