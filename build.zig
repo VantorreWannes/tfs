@@ -1,14 +1,10 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // Options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Packages
     const zbench_pkg = b.dependency("zbench", .{ .target = target, .optimize = optimize });
-
-    // Modules
     const zbench_mod = zbench_pkg.module("zbench");
 
     const root_mod = b.addModule("tfs", .{
@@ -31,10 +27,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "tfs", .module = root_mod }, .{ .name = "zbench", .module = zbench_mod } },
+        .imports = &.{
+            .{ .name = "tfs", .module = root_mod },
+            .{ .name = "zbench", .module = zbench_mod },
+        },
     });
 
-    // Libraries
     const root_lib = b.addLibrary(.{
         .name = "tfs",
         .linkage = .dynamic,
@@ -42,14 +40,12 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
 
-    // Directories
     const docs_dir = b.addInstallDirectory(.{
         .source_dir = root_lib.getEmittedDocs(),
         .install_dir = .prefix,
         .install_subdir = "docs",
     });
 
-    // Binaries
     const main_bin = b.addExecutable(.{
         .name = "tfs",
         .root_module = main_mod,
@@ -74,7 +70,6 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
 
-    // Commands
     const run_cmd = b.addRunArtifact(main_bin);
     const bench_cmd = b.addRunArtifact(bench_bin);
     const test_root_cmd = b.addRunArtifact(root_test_bin);
@@ -87,24 +82,19 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    // Steps - Run
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    // Steps - Benchmarks
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&bench_cmd.step);
 
-    // Steps - Tests
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&test_main_cmd.step);
     test_step.dependOn(&test_root_cmd.step);
 
-    // Steps - Docs
     const docs_step = b.step("docs", "Install docs into zig-out/docs");
     docs_step.dependOn(&docs_dir.step);
 
-    // Install
     b.installArtifact(main_bin);
     b.installArtifact(root_test_bin);
     b.installArtifact(root_lib);

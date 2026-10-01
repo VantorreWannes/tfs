@@ -1,712 +1,694 @@
 const std = @import("std");
 
-inline fn readInt(reader: anytype, comptime T: type) !T {
-    var buf: [@sizeOf(T)]u8 = undefined;
-    try reader.readSliceAll(&buf);
-    return std.mem.readInt(T, &buf, .little);
-}
-
-inline fn writeInt(writer: anytype, comptime T: type, val: T) !void {
-    var buf: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, &buf, val, .little);
-    try writer.writeAll(&buf);
-}
-
-pub fn DenseDAG(comptime Index: type, comptime Leaf: type) type {
+pub fn DeduplicationTable(comptime Index: type, comptime Context: type) type {
     comptime {
-        const idx_info = @typeInfo(Index);
-        if (idx_info != .int or idx_info.int.signedness != .unsigned) {
+        if (@typeInfo(Index) != .int or @typeInfo(Index).int.signedness != .unsigned) {
             @compileError("Index must be an unsigned integer");
         }
-        const leaf_info = @typeInfo(Leaf);
-        if (leaf_info != .int or leaf_info.int.signedness != .unsigned) {
-            @compileError("Leaf must be an unsigned integer");
+    }
+
+    return struct {
+        const Self = @This();
+        pub const EMPTY: Index = std.math.maxInt(Index);
+
+        slots: []Index,
+        count: usize,
+
+        pub fn init(allocator: std.mem.Allocator, initial_capacity: usize) !Self {
+            const cap = if (initial_capacity > 0)
+                try std.math.ceilPowerOfTwo(usize, @max(initial_capacity, 16))
+            else
+                0;
+
+            const slots = try allocator.alloc(Index, cap);
+            @memset(slots, EMPTY);
+
+            return .{
+                .slots = slots,
+                .count = 0,
+            };
+        }
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.slots);
+            self.* = undefined;
+        }
+
+        pub fn find(self: *const Self, ctx: Context, key: Context.Key) ?Index {
+            if (self.slots.len == 0) return null;
+            const mask = self.slots.len - 1;
+            var idx = @as(usize, @intCast(ctx.hash(key))) & mask;
+
+            while (self.slots[idx] != EMPTY) : (idx = (idx + 1) & mask) {
+                const candidate = self.slots[idx];
+                if (ctx.eql(key, candidate)) return candidate;
+            }
+            return null;
+        }
+
+        pub fn insert(self: *Self, allocator: std.mem.Allocator, ctx: Context, key: Context.Key, value: Index) !void {
+            if ((self.count + 1) * 2 >= self.slots.len) {
+                try self.grow(allocator, ctx);
+            }
+
+            const mask = self.slots.len - 1;
+            var idx = @as(usize, @intCast(ctx.hash(key))) & mask;
+
+            while (self.slots[idx] != EMPTY) : (idx = (idx + 1) & mask) {
+                if (ctx.eql(key, self.slots[idx])) {
+                    self.slots[idx] = value;
+                    return;
+                }
+            }
+
+            self.slots[idx] = value;
+            self.count += 1;
+        }
+
+        fn grow(self: *Self, allocator: std.mem.Allocator, ctx: Context) !void {
+            const new_cap = @max(self.slots.len * 2, 32);
+            const new_slots = try allocator.alloc(Index, new_cap);
+            @memset(new_slots, EMPTY);
+
+            const new_mask = new_cap - 1;
+            for (self.slots) |idx| {
+                if (idx == EMPTY) continue;
+                const key = ctx.getKey(idx);
+                var slot = @as(usize, @intCast(ctx.hash(key))) & new_mask;
+                while (new_slots[slot] != EMPTY) : (slot = (slot + 1) & new_mask) {}
+                new_slots[slot] = idx;
+            }
+
+            allocator.free(self.slots);
+            self.slots = new_slots;
+        }
+    };
+}
+
+pub fn DenseDag(
+    comptime Index: type,
+    comptime TargetChunkSize: usize,
+) type {
+    comptime {
+        if (@typeInfo(Index) != .int or @typeInfo(Index).int.signedness != .unsigned) {
+            @compileError("Index must be an unsigned integer");
+        }
+        if (TargetChunkSize < 4) {
+            @compileError("TargetChunkSize must be at least 4 bytes");
         }
     }
 
     return struct {
         const Self = @This();
         pub const I = Index;
-        pub const L = Leaf;
-        pub const LEAF_LIMIT: I = @as(I, 1) << @typeInfo(L).int.bits;
 
-        pub const NUM_TIERS: usize = @sizeOf(I) - 1;
+        pub const MIN_CHUNK_SIZE: usize = @max(1, TargetChunkSize / 2);
+        pub const MAX_CHUNK_SIZE: usize = TargetChunkSize * 4;
+        pub const CHUNK_MASK: u32 = (@as(u32, 1) << @intCast(std.math.log2_int(usize, TargetChunkSize))) - 1;
 
-        pub const Pair = extern struct {
-            l: I,
-            r: I,
-        };
+        pub const Ref = packed struct(Index) {
+            index: @Int(.unsigned, @bitSizeOf(Index) - 1),
+            is_internal: bool,
 
-        pub fn TierPair(comptime byte_width: usize) type {
-            const IntT = @Int(.unsigned, byte_width * 8);
+            pub const null_ref: Ref = @bitCast(@as(Index, std.math.maxInt(Index)));
 
-            return extern struct {
-                l: [byte_width]u8,
-                r: [byte_width]u8,
-
-                pub const Int = IntT;
-                pub const width = byte_width;
-
-                pub inline fn pack(l_val: I, r_val: I) @This() {
-                    var pair: @This() = undefined;
-                    std.mem.writeInt(IntT, &pair.l, @truncate(l_val), .little);
-                    std.mem.writeInt(IntT, &pair.r, @truncate(r_val), .little);
-                    return pair;
-                }
-
-                pub inline fn unpackL(self: @This()) I {
-                    return @as(I, std.mem.readInt(IntT, &self.l, .little));
-                }
-
-                pub inline fn unpackR(self: @This()) I {
-                    return @as(I, std.mem.readInt(IntT, &self.r, .little));
-                }
-            };
-        }
-
-        const Key = struct {
-            l: I,
-            r: I,
-
-            pub fn hash(self: Key) u64 {
-                var h = std.hash.Wyhash.init(0);
-                h.update(std.mem.asBytes(&self.l));
-                h.update(std.mem.asBytes(&self.r));
-                return h.final();
+            pub inline fn isNull(self: Ref) bool {
+                return self.raw() == std.math.maxInt(Index);
             }
 
-            pub fn eql(a: Key, b: Key) bool {
-                return a.l == b.l and a.r == b.r;
+            pub inline fn initLeaf(idx: usize) Ref {
+                return .{ .index = @intCast(idx), .is_internal = false };
+            }
+
+            pub inline fn initInternal(idx: usize) Ref {
+                return .{ .index = @intCast(idx), .is_internal = true };
+            }
+
+            pub inline fn raw(self: Ref) Index {
+                return @bitCast(self);
+            }
+
+            pub inline fn fromRaw(val: Index) Ref {
+                return @bitCast(val);
             }
         };
 
-        const KeyContext = struct {
-            pub fn hash(_: @This(), k: Key) u64 {
-                return k.hash();
+        pub const Node = extern struct {
+            left: Ref,
+            right: Ref,
+            weight: u64,
+        };
+
+        pub const ChunkDescriptor = extern struct {
+            offset: u64,
+            length: u32,
+        };
+
+        const NodeContext = struct {
+            pub const Key = struct { left: Ref, right: Ref };
+            dag: *const Self,
+
+            pub inline fn hash(_: NodeContext, key: Key) u64 {
+                var h: u64 = 0xcbf29ce484222325;
+                h = (h ^ key.left.raw()) *% 0x100000001b3;
+                h = (h ^ key.right.raw()) *% 0x100000001b3;
+                return h;
             }
-            pub fn eql(_: @This(), a: Key, b: Key) bool {
-                return a.eql(b);
+
+            pub inline fn eql(self: NodeContext, key: Key, candidate_idx: Index) bool {
+                const node = self.dag.nodes.items[candidate_idx];
+                return node.left.raw() == key.left.raw() and node.right.raw() == key.right.raw();
+            }
+
+            pub inline fn getKey(self: NodeContext, candidate_idx: Index) Key {
+                const node = self.dag.nodes.items[candidate_idx];
+                return .{ .left = node.left, .right = node.right };
             }
         };
 
-        nodes: std.ArrayList(Pair),
-        weights: std.ArrayList(u64),
-        lookup: std.HashMap(Key, I, KeyContext, 80),
+        const ChunkContext = struct {
+            pub const Key = []const u8;
+            dag: *const Self,
+
+            pub inline fn hash(_: ChunkContext, key: Key) u64 {
+                return std.hash.XxHash64.hash(0, key);
+            }
+
+            pub inline fn eql(self: ChunkContext, key: Key, candidate_idx: Index) bool {
+                const desc = self.dag.chunks.items[candidate_idx];
+                const slice = self.dag.chunk_payload.items[desc.offset .. desc.offset + desc.length];
+                return std.mem.eql(u8, key, slice);
+            }
+
+            pub inline fn getKey(self: ChunkContext, candidate_idx: Index) Key {
+                const desc = self.dag.chunks.items[candidate_idx];
+                return self.dag.chunk_payload.items[desc.offset .. desc.offset + desc.length];
+            }
+        };
+
+        pub const NodeMap = DeduplicationTable(Index, NodeContext);
+        pub const ChunkMap = DeduplicationTable(Index, ChunkContext);
+
+        pub const GEAR_TABLE: [256]u32 = blk: {
+            @setEvalBranchQuota(100000);
+            var table: [256]u32 = undefined;
+            var state: u64 = 0x2545F4914F6CDD1D;
+            for (&table) |*slot| {
+                state = state *% 6364136223846793005 +% 1442695040888963407;
+                slot.* = @truncate(state >> 16);
+            }
+            break :blk table;
+        };
+
+        nodes: std.ArrayList(Node),
+        chunks: std.ArrayList(ChunkDescriptor),
+        chunk_payload: std.ArrayList(u8),
+        node_index: NodeMap,
+        chunk_index: ChunkMap,
 
         pub fn init(allocator: std.mem.Allocator) !Self {
             return .{
-                .nodes = try std.ArrayList(Pair).initCapacity(allocator, 65536),
-                .weights = try std.ArrayList(u64).initCapacity(allocator, 65536),
-                .lookup = std.HashMap(Key, I, KeyContext, 80).init(allocator),
+                .nodes = try std.ArrayList(Node).initCapacity(allocator, 1024),
+                .chunks = try std.ArrayList(ChunkDescriptor).initCapacity(allocator, 1024),
+                .chunk_payload = try std.ArrayList(u8).initCapacity(allocator, 16384),
+                .node_index = try NodeMap.init(allocator, 2048),
+                .chunk_index = try ChunkMap.init(allocator, 2048),
             };
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            self.lookup.deinit();
-            self.weights.deinit(allocator);
+            self.chunk_index.deinit(allocator);
+            self.node_index.deinit(allocator);
+            self.chunk_payload.deinit(allocator);
+            self.chunks.deinit(allocator);
             self.nodes.deinit(allocator);
         }
 
-        pub inline fn weightOf(self: *const Self, id: I) u64 {
-            if (id < LEAF_LIMIT) return @sizeOf(L);
-            return self.weights.items[id - LEAF_LIMIT];
+        pub inline fn weightOf(self: *const Self, ref: Ref) u64 {
+            if (ref.isNull()) return 0;
+            return if (ref.is_internal)
+                self.nodes.items[ref.index].weight
+            else
+                self.chunks.items[ref.index].length;
         }
 
-        pub fn rebuildIndex(self: *Self) !void {
-            try self.lookup.ensureTotalCapacity(@intCast(self.nodes.items.len));
-            for (self.nodes.items, 0..) |p, idx| {
-                const id: I = @intCast(LEAF_LIMIT + idx);
-                self.lookup.putAssumeCapacity(.{ .l = p.l, .r = p.r }, id);
+        pub fn registerChunk(self: *Self, allocator: std.mem.Allocator, bytes: []const u8) !Ref {
+            const ctx = ChunkContext{ .dag = self };
+            if (self.chunk_index.find(ctx, bytes)) |existing_idx| {
+                return Ref.initLeaf(existing_idx);
             }
+
+            const chunk_idx: Index = @intCast(self.chunks.items.len);
+            const payload_offset = self.chunk_payload.items.len;
+
+            try self.chunk_payload.appendSlice(allocator, bytes);
+            try self.chunks.append(allocator, .{
+                .offset = payload_offset,
+                .length = @intCast(bytes.len),
+            });
+
+            try self.chunk_index.insert(allocator, ctx, bytes, chunk_idx);
+            return Ref.initLeaf(chunk_idx);
         }
 
-        pub fn combine(self: *Self, allocator: std.mem.Allocator, l: I, r: I) !I {
-            const key = Key{ .l = l, .r = r };
-            if (self.lookup.get(key)) |id| {
-                return id;
+        pub fn combine(self: *Self, allocator: std.mem.Allocator, left: Ref, right: Ref) !Ref {
+            const ctx = NodeContext{ .dag = self };
+            const key = NodeContext.Key{ .left = left, .right = right };
+
+            if (self.node_index.find(ctx, key)) |existing_idx| {
+                return Ref.initInternal(existing_idx);
             }
 
-            const id: I = @intCast(LEAF_LIMIT + self.nodes.items.len);
-            const w = self.weightOf(l) + self.weightOf(r);
+            const node_idx: Index = @intCast(self.nodes.items.len);
+            const combined_weight = self.weightOf(left) + self.weightOf(right);
 
-            try self.nodes.append(allocator, .{ .l = l, .r = r });
-            try self.weights.append(allocator, w);
-            try self.lookup.put(key, id);
-            return id;
+            try self.nodes.append(allocator, .{
+                .left = left,
+                .right = right,
+                .weight = combined_weight,
+            });
+
+            try self.node_index.insert(allocator, ctx, key, node_idx);
+            return Ref.initInternal(node_idx);
         }
 
-        fn ingestChunk(self: *Self, allocator: std.mem.Allocator, input_symbols: []const I) !I {
-            if (input_symbols.len == 0) return 0;
-            if (input_symbols.len == 1) return input_symbols[0];
-
-            const buf_a = try allocator.alloc(I, input_symbols.len);
-            defer allocator.free(buf_a);
-            const buf_b = try allocator.alloc(I, input_symbols.len);
-            defer allocator.free(buf_b);
-
-            @memcpy(buf_a, input_symbols);
-
-            var src = buf_a;
-            var dst = buf_b;
-            var src_len = input_symbols.len;
-
-            while (src_len > 1) {
-                var matched_any = false;
-                var dst_idx: usize = 0;
-                var i: usize = 0;
-
-                while (i < src_len) {
-                    if (i + 1 < src_len) {
-                        const k = Key{ .l = src[i], .r = src[i + 1] };
-                        if (self.lookup.get(k)) |existing_id| {
-                            dst[dst_idx] = existing_id;
-                            dst_idx += 1;
-                            i += 2;
-                            matched_any = true;
-                            continue;
-                        }
-                    }
-                    dst[dst_idx] = src[i];
-                    dst_idx += 1;
-                    i += 1;
-                }
-
-                src_len = dst_idx;
-                const tmp = src;
-                src = dst;
-                dst = tmp;
-
-                if (!matched_any) break;
-            }
-
-            var counts = std.HashMap(Key, u32, KeyContext, 80).init(allocator);
-            defer counts.deinit();
-
-            while (src_len > 1) {
-                counts.clearRetainingCapacity();
-
-                var max_freq: u32 = 0;
-                for (0..src_len - 1) |i| {
-                    const k = Key{ .l = src[i], .r = src[i + 1] };
-                    const entry = try counts.getOrPut(k);
-                    if (!entry.found_existing) {
-                        entry.value_ptr.* = 1;
-                    } else {
-                        entry.value_ptr.* += 1;
-                    }
-                    if (entry.value_ptr.* > max_freq) {
-                        max_freq = entry.value_ptr.*;
-                    }
-                }
-
-                if (max_freq < 2) break;
-
-                const threshold = @max(2, max_freq / 2);
-
-                var dst_idx: usize = 0;
-                var i: usize = 0;
-                var replaced_any = false;
-
-                while (i < src_len) {
-                    if (i + 1 < src_len) {
-                        const k = Key{ .l = src[i], .r = src[i + 1] };
-                        if (counts.get(k)) |c| {
-                            if (c >= threshold) {
-                                const new_id = try self.combine(allocator, src[i], src[i + 1]);
-                                dst[dst_idx] = new_id;
-                                dst_idx += 1;
-                                i += 2;
-                                replaced_any = true;
-                                continue;
-                            }
-                        }
-                    }
-                    dst[dst_idx] = src[i];
-                    dst_idx += 1;
-                    i += 1;
-                }
-
-                src_len = dst_idx;
-                const tmp = src;
-                src = dst;
-                dst = tmp;
-
-                if (!replaced_any) break;
-            }
-
-            while (src_len > 1) {
-                var dst_idx: usize = 0;
-                var i: usize = 0;
-                while (i < src_len) {
-                    if (i + 1 < src_len) {
-                        dst[dst_idx] = try self.combine(allocator, src[i], src[i + 1]);
-                        dst_idx += 1;
-                        i += 2;
-                    } else {
-                        dst[dst_idx] = src[i];
-                        dst_idx += 1;
-                        i += 1;
-                    }
-                }
-                src_len = dst_idx;
-                const tmp = src;
-                src = dst;
-                dst = tmp;
-            }
-
-            return src[0];
-        }
-
-        pub fn ingestLeaves(self: *Self, allocator: std.mem.Allocator, leaves: []const L) !I {
-            if (leaves.len == 0) return 0;
-            if (leaves.len == 1) return @as(I, leaves[0]);
-
-            const CHUNK_SIZE: usize = 64 * 1024;
-            const num_chunks = (leaves.len + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
-            if (num_chunks == 1) {
-                const chunk_leaves = try allocator.alloc(I, leaves.len);
-                defer allocator.free(chunk_leaves);
-                for (leaves, 0..) |sym, i| {
-                    chunk_leaves[i] = @as(I, sym);
-                }
-                return self.ingestChunk(allocator, chunk_leaves);
-            }
-
-            const chunk_roots = try allocator.alloc(I, num_chunks);
-            defer allocator.free(chunk_roots);
-
-            const chunk_buf = try allocator.alloc(I, CHUNK_SIZE);
-            defer allocator.free(chunk_buf);
-
-            for (0..num_chunks) |ci| {
-                const start = ci * CHUNK_SIZE;
-                const end = @min(start + CHUNK_SIZE, leaves.len);
-                const len = end - start;
-
-                for (leaves[start..end], 0..) |sym, i| {
-                    chunk_buf[i] = @as(I, sym);
-                }
-
-                chunk_roots[ci] = try self.ingestChunk(allocator, chunk_buf[0..len]);
-            }
-
-            return self.ingestChunk(allocator, chunk_roots);
-        }
-
-        const Frame = struct {
-            id: I,
-            offset: u64,
-            len: u64,
-        };
-
-        pub fn readSlice(
+        pub fn read(
             self: *const Self,
-            allocator: std.mem.Allocator,
-            root_id: I,
+            root: Ref,
+            total_size: u64,
             offset: u64,
-            dest: []u8,
-        ) !usize {
-            const total = self.weightOf(root_id);
-            if (offset >= total or dest.len == 0) return 0;
+            destination: []u8,
+        ) usize {
+            if (offset >= total_size or destination.len == 0 or root.isNull()) return 0;
 
-            const target_len = @min(dest.len, @as(usize, @intCast(total - offset)));
+            const target_length = @min(destination.len, @as(usize, @intCast(total_size - offset)));
             var cursor: usize = 0;
 
-            var stack_buf: [128]Frame = undefined;
-            var dynamic_stack: ?std.ArrayListUnmanaged(Frame) = null;
-            defer if (dynamic_stack) |*ds| ds.deinit(allocator);
-
+            const Frame = struct { ref: Ref, offset: u64, length: u64 };
+            var stack: [64]Frame = undefined;
             var depth: usize = 1;
-            stack_buf[0] = .{ .id = root_id, .offset = offset, .len = target_len };
+            stack[0] = .{ .ref = root, .offset = offset, .length = target_length };
 
             while (depth > 0) {
                 depth -= 1;
-                const top = if (dynamic_stack) |ds|
-                    if (depth >= stack_buf.len) ds.items[depth - stack_buf.len] else stack_buf[depth]
-                else
-                    stack_buf[depth];
+                const frame = stack[depth];
 
-                if (top.id < LEAF_LIMIT) {
-                    const leaf_val: L = @intCast(top.id);
-                    const leaf_bytes = std.mem.asBytes(&leaf_val);
+                if (!frame.ref.is_internal) {
+                    const desc = self.chunks.items[frame.ref.index];
+                    const payload = self.chunk_payload.items[desc.offset .. desc.offset + desc.length];
+                    const slice = payload[frame.offset .. frame.offset + frame.length];
 
-                    for (leaf_bytes[top.offset..]) |b| {
-                        if (cursor >= target_len) return cursor;
-                        dest[cursor] = b;
-                        cursor += 1;
-                    }
+                    @memcpy(destination[cursor .. cursor + slice.len], slice);
+                    cursor += slice.len;
+                    if (cursor >= target_length) return cursor;
                     continue;
                 }
 
-                const pair = self.nodes.items[top.id - LEAF_LIMIT];
-                const l_size = self.weightOf(pair.l);
+                const node = self.nodes.items[frame.ref.index];
+                const left_size = self.weightOf(node.left);
 
-                if (top.offset + top.len > l_size) {
-                    const r_start = if (top.offset > l_size) top.offset - l_size else 0;
-                    const r_avail = (top.offset + top.len) - l_size;
-                    const r_read = @min(r_avail, self.weightOf(pair.r) - r_start);
-                    const next_frame = Frame{ .id = pair.r, .offset = r_start, .len = r_read };
-
-                    if (depth < stack_buf.len) {
-                        stack_buf[depth] = next_frame;
-                    } else {
-                        if (dynamic_stack == null) dynamic_stack = .{};
-                        try dynamic_stack.?.append(allocator, next_frame);
-                    }
+                if (frame.offset + frame.length > left_size) {
+                    const right_start = if (frame.offset > left_size) frame.offset - left_size else 0;
+                    const right_len = if (frame.offset > left_size)
+                        frame.length
+                    else
+                        (frame.offset + frame.length) - left_size;
+                    stack[depth] = .{ .ref = node.right, .offset = right_start, .length = right_len };
                     depth += 1;
                 }
 
-                if (top.offset < l_size) {
-                    const l_read = @min(top.len, l_size - top.offset);
-                    const next_frame = Frame{ .id = pair.l, .offset = top.offset, .len = l_read };
-
-                    if (depth < stack_buf.len) {
-                        stack_buf[depth] = next_frame;
-                    } else {
-                        if (dynamic_stack == null) dynamic_stack = .{};
-                        try dynamic_stack.?.append(allocator, next_frame);
-                    }
+                if (frame.offset < left_size) {
+                    const left_read = @min(frame.length, left_size - frame.offset);
+                    stack[depth] = .{ .ref = node.left, .offset = frame.offset, .length = left_read };
                     depth += 1;
                 }
             }
 
             return cursor;
         }
-
-        pub fn reconstruct(self: *const Self, allocator: std.mem.Allocator, root_id: I, writer: anytype) !void {
-            if (root_id == 0) return;
-
-            var stack = try std.ArrayList(I).initCapacity(allocator, 4096);
-            defer stack.deinit(allocator);
-            try stack.append(allocator, root_id);
-
-            var out_buf: [8192]u8 = undefined;
-            var buf_pos: usize = 0;
-
-            while (stack.items.len > 0) {
-                const curr = stack.pop().?;
-                if (curr < LEAF_LIMIT) {
-                    const leaf_val: L = @intCast(curr);
-                    const leaf_bytes = std.mem.asBytes(&leaf_val);
-                    for (leaf_bytes) |b| {
-                        out_buf[buf_pos] = b;
-                        buf_pos += 1;
-                        if (buf_pos == out_buf.len) {
-                            try writer.writeAll(&out_buf);
-                            buf_pos = 0;
-                        }
-                    }
-                } else {
-                    const idx = curr - LEAF_LIMIT;
-                    if (idx >= self.nodes.items.len) return error.CorruptNode;
-                    const p = self.nodes.items[idx];
-
-                    try stack.append(allocator, p.r);
-                    try stack.append(allocator, p.l);
-                }
-            }
-
-            if (buf_pos > 0) {
-                try writer.writeAll(out_buf[0..buf_pos]);
-            }
-        }
     };
 }
 
-pub fn Catalog(comptime Index: type) type {
+pub fn FileSystem(
+    comptime Index: type,
+    comptime TargetChunkSize: usize,
+) type {
     return struct {
         const Self = @This();
+        pub const Dag = DenseDag(Index, TargetChunkSize);
+        pub const Ref = Dag.Ref;
         pub const I = Index;
 
-        pub const Entry = struct {
-            name: []const u8,
-            root_id: I,
-        };
-
-        entries: std.ArrayList(Entry),
-
-        pub fn init(allocator: std.mem.Allocator) !Self {
-            return .{ .entries = try std.ArrayList(Entry).initCapacity(allocator, 16) };
-        }
-
-        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            for (self.entries.items) |e| allocator.free(e.name);
-            self.entries.deinit(allocator);
-        }
-
-        pub fn readFrom(allocator: std.mem.Allocator, reader: anytype) !Self {
-            const entry_count = try readInt(reader, u64);
-            var self = try Self.init(allocator);
-
-            for (0..entry_count) |_| {
-                const name_len = try readInt(reader, u64);
-                const name_buf = try allocator.alloc(u8, name_len);
-                try reader.readSliceAll(name_buf);
-                const root_id = try readInt(reader, I);
-                try self.entries.append(allocator, .{ .name = name_buf, .root_id = root_id });
-            }
-            return self;
-        }
-
-        pub fn put(self: *Self, allocator: std.mem.Allocator, name: []const u8, root_id: I) !void {
-            for (self.entries.items) |*e| {
-                if (std.mem.eql(u8, e.name, name)) {
-                    e.root_id = root_id;
-                    return;
-                }
-            }
-            try self.entries.append(allocator, .{
-                .name = try allocator.dupe(u8, name),
-                .root_id = root_id,
-            });
-        }
-
-        pub fn get(self: *const Self, name: []const u8) ?I {
-            for (self.entries.items) |e| {
-                if (std.mem.eql(u8, e.name, name)) return e.root_id;
-            }
-            return null;
-        }
-    };
-}
-
-pub fn Archive(comptime Index: type, comptime Leaf: type) type {
-    return struct {
-        const Self = @This();
-        pub const Dag = DenseDAG(Index, Leaf);
-        pub const Cat = Catalog(Index);
-        pub const I = Index;
-        pub const L = Leaf;
-        pub const MAGIC: [4]u8 = "TFSD".*;
-
-        pub const Kind = enum { file, directory };
-        pub const Stat = struct {
+        pub const PathEntry = struct {
+            path: []const u8,
+            root: Ref,
             size: u64,
-            root_id: I,
-            kind: Kind,
-        };
-
-        pub const DirEntry = struct {
-            name: []const u8,
-            stat: Stat,
+            chunk_buffer: std.ArrayList(u8),
+            rolling_hash: u32,
+            levels: std.ArrayList(std.ArrayList(Ref)),
+            dirty: bool,
         };
 
         dag: Dag,
-        catalog: Cat,
+        entries: std.ArrayList(PathEntry),
+        active_entry: ?*PathEntry,
 
         pub fn init(allocator: std.mem.Allocator) !Self {
             return .{
                 .dag = try Dag.init(allocator),
-                .catalog = try Cat.init(allocator),
+                .entries = try std.ArrayList(PathEntry).initCapacity(allocator, 16),
+                .active_entry = null,
             };
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            self.catalog.deinit(allocator);
+            for (self.entries.items) |*entry| {
+                allocator.free(entry.path);
+                entry.chunk_buffer.deinit(allocator);
+                for (entry.levels.items) |*level| level.deinit(allocator);
+                entry.levels.deinit(allocator);
+            }
+            self.entries.deinit(allocator);
             self.dag.deinit(allocator);
         }
 
-        pub fn readCatalogOnly(allocator: std.mem.Allocator, reader: anytype) !Cat {
-            var magic: [4]u8 = undefined;
-            try reader.readSliceAll(&magic);
-            if (!std.mem.eql(u8, &magic, &MAGIC)) return error.InvalidArchiveFormat;
-            return try Cat.readFrom(allocator, reader);
-        }
+        pub fn prepareForEncode(self: *Self, allocator: std.mem.Allocator, path: []const u8) !void {
+            var unique_path = try allocator.dupe(u8, path);
+            var version: usize = 0;
 
-        pub fn readFrom(allocator: std.mem.Allocator, reader: anytype, comptime rebuild_hash_index: bool) !Self {
-            var magic: [4]u8 = undefined;
-            try reader.readSliceAll(&magic);
-            if (!std.mem.eql(u8, &magic, &MAGIC)) return error.InvalidArchiveFormat;
-
-            const catalog = try Cat.readFrom(allocator, reader);
-            const total_nodes = try readInt(reader, u64);
-
-            var tier_counts: [Dag.NUM_TIERS]u64 = undefined;
-            for (0..Dag.NUM_TIERS) |i| {
-                tier_counts[i] = try readInt(reader, u64);
+            while (self.findEntry(unique_path) != null) {
+                allocator.free(unique_path);
+                unique_path = try std.fmt.allocPrint(allocator, "{s}.{d}", .{ path, version });
+                version += 1;
             }
 
-            var dag = try Dag.init(allocator);
-            try dag.nodes.resize(allocator, total_nodes);
+            try self.entries.append(allocator, .{
+                .path = unique_path,
+                .root = Ref.null_ref,
+                .size = 0,
+                .chunk_buffer = try std.ArrayList(u8).initCapacity(allocator, Dag.MAX_CHUNK_SIZE),
+                .rolling_hash = 0,
+                .levels = try std.ArrayList(std.ArrayList(Ref)).initCapacity(allocator, 16),
+                .dirty = true,
+            });
+            self.active_entry = &self.entries.items[self.entries.items.len - 1];
+        }
 
-            var offset: usize = 0;
-            inline for (0..Dag.NUM_TIERS) |tier_idx| {
-                const bw = tier_idx + 2;
-                const PairT = Dag.TierPair(bw);
-                const count = tier_counts[tier_idx];
+        pub fn findEntry(self: *const Self, path: []const u8) ?*PathEntry {
+            if (self.active_entry) |active| {
+                if (std.mem.eql(u8, active.path, path)) return active;
+            }
+            for (self.entries.items) |*entry| {
+                if (std.mem.eql(u8, entry.path, path)) return entry;
+            }
+            return null;
+        }
 
-                var read_items: usize = 0;
-                var chunk_buf: [2048]PairT = undefined;
+        pub fn getOrAddEntry(self: *Self, allocator: std.mem.Allocator, path: []const u8) !*PathEntry {
+            if (self.findEntry(path)) |entry| {
+                self.active_entry = entry;
+                return entry;
+            }
 
-                while (read_items < count) {
-                    const to_read = @min(count - read_items, chunk_buf.len);
-                    try reader.readSliceAll(std.mem.sliceAsBytes(chunk_buf[0..to_read]));
+            try self.entries.append(allocator, .{
+                .path = try allocator.dupe(u8, path),
+                .root = Ref.null_ref,
+                .size = 0,
+                .chunk_buffer = try std.ArrayList(u8).initCapacity(allocator, Dag.MAX_CHUNK_SIZE),
+                .rolling_hash = 0,
+                .levels = try std.ArrayList(std.ArrayList(Ref)).initCapacity(allocator, 16),
+                .dirty = false,
+            });
 
-                    for (0..to_read) |idx| {
-                        dag.nodes.items[offset + read_items + idx] = .{
-                            .l = chunk_buf[idx].unpackL(),
-                            .r = chunk_buf[idx].unpackR(),
-                        };
+            const entry = &self.entries.items[self.entries.items.len - 1];
+            self.active_entry = entry;
+            return entry;
+        }
+
+        inline fn isTreeBoundary(ref: Ref) bool {
+            var z = (@as(u64, ref.raw()) ^ 0x9E3779B97F4A7C15);
+            z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+            z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+            return ((z ^ (z >> 31)) & 0x07) == 0;
+        }
+
+        fn foldSlice(self: *Self, allocator: std.mem.Allocator, items: []const Ref) std.mem.Allocator.Error!Ref {
+            if (items.len == 0) return Ref.null_ref;
+            if (items.len == 1) return items[0];
+            const mid = items.len / 2;
+            const left = try self.foldSlice(allocator, items[0..mid]);
+            const right = try self.foldSlice(allocator, items[mid..]);
+            return try self.dag.combine(allocator, left, right);
+        }
+
+        fn pushToTree(self: *Self, allocator: std.mem.Allocator, entry: *PathEntry, level: usize, ref: Ref) std.mem.Allocator.Error!void {
+            while (entry.levels.items.len <= level) {
+                try entry.levels.append(allocator, try std.ArrayList(Ref).initCapacity(allocator, 32));
+            }
+
+            var current = &entry.levels.items[level];
+            try current.append(allocator, ref);
+
+            if ((isTreeBoundary(ref) and current.items.len >= 2) or current.items.len >= 16) {
+                const subtree = try self.foldSlice(allocator, current.items);
+                current.clearRetainingCapacity();
+                try self.pushToTree(allocator, entry, level + 1, subtree);
+            }
+        }
+
+        fn flushActiveChunk(self: *Self, allocator: std.mem.Allocator, entry: *PathEntry) !void {
+            if (entry.chunk_buffer.items.len == 0) return;
+            const leaf_ref = try self.dag.registerChunk(allocator, entry.chunk_buffer.items);
+            entry.chunk_buffer.clearRetainingCapacity();
+            entry.rolling_hash = 0;
+            try self.pushToTree(allocator, entry, 0, leaf_ref);
+        }
+
+        pub fn appendSlice(self: *Self, allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+            const entry = try self.getOrAddEntry(allocator, path);
+            entry.dirty = true;
+            entry.size += bytes.len;
+
+            var cursor: usize = 0;
+            while (cursor < bytes.len) {
+                const b = bytes[cursor];
+                cursor += 1;
+                try entry.chunk_buffer.append(allocator, b);
+                entry.rolling_hash = (entry.rolling_hash << 1) +% Dag.GEAR_TABLE[b];
+
+                if (entry.chunk_buffer.items.len >= Dag.MIN_CHUNK_SIZE) {
+                    if ((entry.rolling_hash & Dag.CHUNK_MASK) == 0 or entry.chunk_buffer.items.len >= Dag.MAX_CHUNK_SIZE) {
+                        try self.flushActiveChunk(allocator, entry);
                     }
-                    read_items += to_read;
                 }
-                offset += count;
             }
-
-            try dag.weights.resize(allocator, total_nodes);
-            for (dag.nodes.items, 0..) |p, idx| {
-                dag.weights.items[idx] = dag.weightOf(p.l) + dag.weightOf(p.r);
-            }
-
-            if (rebuild_hash_index) {
-                try dag.rebuildIndex();
-            }
-
-            return .{ .dag = dag, .catalog = catalog };
         }
 
-        pub fn writeTo(self: *const Self, writer: anytype) !void {
-            try writer.writeAll(&MAGIC);
-            try writeInt(writer, u64, self.catalog.entries.items.len);
-            for (self.catalog.entries.items) |e| {
-                try writeInt(writer, u64, e.name.len);
-                try writer.writeAll(e.name);
-                try writeInt(writer, I, e.root_id);
+        pub fn syncEntry(self: *Self, allocator: std.mem.Allocator, entry: *PathEntry) !Ref {
+            if (!entry.dirty) return entry.root;
+
+            if (entry.chunk_buffer.items.len > 0) {
+                try self.flushActiveChunk(allocator, entry);
             }
 
-            const total: u64 = self.dag.nodes.items.len;
-            try writeInt(writer, u64, total);
+            var level: usize = 0;
+            while (level < entry.levels.items.len) : (level += 1) {
+                const current = &entry.levels.items[level];
+                if (current.items.len == 0) continue;
+                if (current.items.len == 1 and level + 1 >= entry.levels.items.len) break;
 
-            var tier_counts: [Dag.NUM_TIERS]u64 = undefined;
-            var remaining: u64 = total;
-            var prev_limit: u64 = Dag.LEAF_LIMIT;
+                const subtree = try self.foldSlice(allocator, current.items);
+                current.clearRetainingCapacity();
 
-            inline for (0..Dag.NUM_TIERS) |tier_idx| {
-                const bw = tier_idx + 2;
-                const limit: u64 = if (bw >= @sizeOf(I)) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bw * 8));
-                const tier_capacity = if (limit > prev_limit) limit - prev_limit else 0;
-                const count = @min(remaining, tier_capacity);
-                tier_counts[tier_idx] = count;
-                remaining -= count;
-                prev_limit = limit;
-            }
-
-            for (tier_counts) |tc| {
-                try writeInt(writer, u64, tc);
-            }
-
-            var offset: usize = 0;
-            inline for (0..Dag.NUM_TIERS) |tier_idx| {
-                const bw = tier_idx + 2;
-                const PairT = Dag.TierPair(bw);
-                const count = tier_counts[tier_idx];
-
-                var written: usize = 0;
-                var chunk_buf: [2048]PairT = undefined;
-
-                while (written < count) {
-                    const to_write = @min(count - written, chunk_buf.len);
-                    for (0..to_write) |idx| {
-                        const p = self.dag.nodes.items[offset + written + idx];
-                        chunk_buf[idx] = PairT.pack(p.l, p.r);
-                    }
-                    try writer.writeAll(std.mem.sliceAsBytes(chunk_buf[0..to_write]));
-                    written += to_write;
+                while (entry.levels.items.len <= level + 1) {
+                    try entry.levels.append(allocator, try std.ArrayList(Ref).initCapacity(allocator, 32));
                 }
-                offset += count;
+                try entry.levels.items[level + 1].append(allocator, subtree);
             }
-        }
 
-        pub fn encodeLeaves(self: *Self, allocator: std.mem.Allocator, name: []const u8, leaves: []const L) !I {
-            const root_id = try self.dag.ingestLeaves(allocator, leaves);
-            try self.catalog.put(allocator, name, root_id);
-            return root_id;
-        }
-
-        pub fn decodeStream(self: *const Self, allocator: std.mem.Allocator, name: []const u8, writer: anytype) !void {
-            const root_id = self.catalog.get(name) orelse return error.EntryNotFound;
-            try self.dag.reconstruct(allocator, root_id, writer);
-        }
-
-        pub fn stat(self: *const Self, path: []const u8) ?Stat {
-            const clean = cleanPath(path);
-            if (self.isDirectory(clean)) {
-                return .{ .size = 0, .root_id = 0, .kind = .directory };
+            var final_root = Ref.null_ref;
+            var idx = entry.levels.items.len;
+            while (idx > 0) {
+                idx -= 1;
+                if (entry.levels.items[idx].items.len > 0) {
+                    final_root = entry.levels.items[idx].items[0];
+                    break;
+                }
             }
-            const root_id = self.catalog.get(clean) orelse return null;
-            return .{
-                .size = self.dag.weightOf(root_id),
-                .root_id = root_id,
-                .kind = .file,
-            };
+
+            entry.root = final_root;
+            entry.dirty = false;
+            return final_root;
         }
 
-        pub fn readAt(
-            self: *const Self,
+        pub fn read(
+            self: *Self,
             allocator: std.mem.Allocator,
             path: []const u8,
             offset: u64,
-            dest: []u8,
+            destination: []u8,
         ) !usize {
-            const s = self.stat(path) orelse return error.FileNotFound;
-            if (s.kind != .file) return error.IsDirectory;
-            return self.dag.readSlice(allocator, s.root_id, offset, dest);
+            const entry = self.findEntry(path) orelse return error.FileNotFound;
+            const root = try self.syncEntry(allocator, entry);
+            return self.dag.read(root, entry.size, offset, destination);
         }
 
-        pub fn readDir(self: *const Self, allocator: std.mem.Allocator, dir_path: []const u8) ![]DirEntry {
-            const prefix = cleanPath(dir_path);
-            var results = std.ArrayList(DirEntry).init(allocator);
-            var seen = std.StringHashMap(void).init(allocator);
-            defer seen.deinit();
+        pub fn size(self: *Self, allocator: std.mem.Allocator, path: []const u8) !?u64 {
+            const entry = self.findEntry(path) orelse return null;
+            _ = try self.syncEntry(allocator, entry);
+            return entry.size;
+        }
 
-            for (self.catalog.entries.items) |item| {
-                var rel = item.name;
-                if (prefix.len > 0) {
-                    if (!std.mem.startsWith(u8, item.name, prefix)) continue;
-                    if (item.name.len <= prefix.len or item.name[prefix.len] != '/') continue;
-                    rel = item.name[prefix.len + 1 ..];
-                }
+        pub fn writeTo(self: *Self, io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !void {
+            for (self.entries.items) |*entry| {
+                _ = try self.syncEntry(allocator, entry);
+            }
 
-                if (std.mem.indexOfScalar(u8, rel, '/')) |slash| {
-                    const dir_name = rel[0..slash];
-                    if (!seen.contains(dir_name)) {
-                        try seen.put(dir_name, {});
-                        try results.append(allocator, .{
-                            .name = try allocator.dupe(u8, dir_name),
-                            .stat = .{ .size = 0, .root_id = 0, .kind = .directory },
-                        });
-                    }
-                } else {
-                    try results.append(allocator, .{
-                        .name = try allocator.dupe(u8, rel),
-                        .stat = .{
-                            .size = self.dag.weightOf(item.root_id),
-                            .root_id = item.root_id,
-                            .kind = .file,
-                        },
+            var stream_buffer: [65536]u8 = undefined;
+            var buffered_writer = file.writer(io, &stream_buffer);
+            const w = &buffered_writer.interface;
+
+            const total_payload_bytes: u64 = self.dag.chunk_payload.items.len;
+            try w.writeAll(std.mem.asBytes(&total_payload_bytes));
+            if (total_payload_bytes > 0) {
+                try w.writeAll(self.dag.chunk_payload.items);
+            }
+
+            const total_chunks: u64 = self.dag.chunks.items.len;
+            try w.writeAll(std.mem.asBytes(&total_chunks));
+            for (self.dag.chunks.items) |chunk| {
+                try w.writeAll(std.mem.asBytes(&chunk.length));
+            }
+
+            const total_nodes: u64 = self.dag.nodes.items.len;
+            try w.writeAll(std.mem.asBytes(&total_nodes));
+            for (self.dag.nodes.items) |node| {
+                const raw_left = node.left.raw();
+                const raw_right = node.right.raw();
+                try w.writeAll(std.mem.asBytes(&raw_left));
+                try w.writeAll(std.mem.asBytes(&raw_right));
+            }
+
+            const total_entries: u64 = self.entries.items.len;
+            try w.writeAll(std.mem.asBytes(&total_entries));
+            for (self.entries.items) |entry| {
+                const path_len: u32 = @intCast(entry.path.len);
+                try w.writeAll(std.mem.asBytes(&path_len));
+                try w.writeAll(entry.path);
+                const raw_root = entry.root.raw();
+                try w.writeAll(std.mem.asBytes(&raw_root));
+                try w.writeAll(std.mem.asBytes(&entry.size));
+            }
+
+            try w.flush();
+        }
+
+        pub fn loadFrom(self: *Self, io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, comptime rebuild_index: bool) !void {
+            const stat = try file.stat(io);
+            if (stat.size == 0) return;
+
+            var mapping = try std.Io.File.MemoryMap.create(io, file, .{
+                .len = stat.size,
+                .protection = .{ .read = true, .write = false },
+            });
+            defer mapping.destroy(io);
+
+            var cursor: usize = 0;
+            const bytes = mapping.memory;
+
+            const total_payload_bytes = std.mem.bytesToValue(u64, bytes[cursor..][0..@sizeOf(u64)]);
+            cursor += @sizeOf(u64);
+
+            const payload_base = self.dag.chunk_payload.items.len;
+            if (total_payload_bytes > 0) {
+                try self.dag.chunk_payload.appendSlice(allocator, bytes[cursor .. cursor + total_payload_bytes]);
+                cursor += total_payload_bytes;
+            }
+
+            const total_chunks = std.mem.bytesToValue(u64, bytes[cursor..][0..@sizeOf(u64)]);
+            cursor += @sizeOf(u64);
+
+            const chunks_base = self.dag.chunks.items.len;
+            if (total_chunks > 0) {
+                var offset: u64 = payload_base;
+                for (0..total_chunks) |i| {
+                    const chunk_len = std.mem.bytesToValue(u32, bytes[cursor..][0..@sizeOf(u32)]);
+                    cursor += @sizeOf(u32);
+
+                    try self.dag.chunks.append(allocator, .{
+                        .offset = offset,
+                        .length = chunk_len,
                     });
+
+                    if (rebuild_index) {
+                        const chunk_slice = self.dag.chunk_payload.items[offset .. offset + chunk_len];
+                        const chunk_idx: Index = @intCast(chunks_base + i);
+                        const ctx = Dag.ChunkContext{ .dag = &self.dag };
+                        try self.dag.chunk_index.insert(allocator, ctx, chunk_slice, chunk_idx);
+                    }
+
+                    offset += chunk_len;
                 }
             }
 
-            return results.toOwnedSlice(allocator);
-        }
+            const total_nodes = std.mem.bytesToValue(u64, bytes[cursor..][0..@sizeOf(u64)]);
+            cursor += @sizeOf(u64);
 
-        fn isDirectory(self: *const Self, path: []const u8) bool {
-            if (path.len == 0) return true;
-            for (self.catalog.entries.items) |e| {
-                if (e.name.len > path.len and std.mem.startsWith(u8, e.name, path) and e.name[path.len] == '/') {
-                    return true;
+            const nodes_base = self.dag.nodes.items.len;
+            if (total_nodes > 0) {
+                try self.dag.nodes.resize(allocator, nodes_base + total_nodes);
+
+                for (0..total_nodes) |i| {
+                    const node_idx = nodes_base + i;
+                    const raw_left = std.mem.bytesToValue(Index, bytes[cursor..][0..@sizeOf(Index)]);
+                    cursor += @sizeOf(Index);
+                    const raw_right = std.mem.bytesToValue(Index, bytes[cursor..][0..@sizeOf(Index)]);
+                    cursor += @sizeOf(Index);
+
+                    const left = Ref.fromRaw(raw_left);
+                    const right = Ref.fromRaw(raw_right);
+                    const weight = self.dag.weightOf(left) + self.dag.weightOf(right);
+
+                    self.dag.nodes.items[node_idx] = .{
+                        .left = left,
+                        .right = right,
+                        .weight = weight,
+                    };
+
+                    if (rebuild_index) {
+                        const ctx = Dag.NodeContext{ .dag = &self.dag };
+                        const key = Dag.NodeContext.Key{ .left = left, .right = right };
+                        try self.dag.node_index.insert(allocator, ctx, key, @intCast(node_idx));
+                    }
                 }
             }
-            return false;
-        }
 
-        fn cleanPath(path: []const u8) []const u8 {
-            var p = path;
-            while (p.len > 0 and (p[0] == '/' or p[0] == '\\')) p = p[1..];
-            while (p.len > 0 and (p[p.len - 1] == '/' or p[p.len - 1] == '\\')) p = p[0 .. p.len - 1];
-            return p;
+            const total_entries = std.mem.bytesToValue(u64, bytes[cursor..][0..@sizeOf(u64)]);
+            cursor += @sizeOf(u64);
+
+            for (0..total_entries) |_| {
+                const name_len = std.mem.bytesToValue(u32, bytes[cursor..][0..@sizeOf(u32)]);
+                cursor += @sizeOf(u32);
+
+                const entry_path = bytes[cursor .. cursor + name_len];
+                cursor += name_len;
+
+                const raw_root = std.mem.bytesToValue(Index, bytes[cursor..][0..@sizeOf(Index)]);
+                cursor += @sizeOf(Index);
+
+                const entry_size = std.mem.bytesToValue(u64, bytes[cursor..][0..@sizeOf(u64)]);
+                cursor += @sizeOf(u64);
+
+                try self.entries.append(allocator, .{
+                    .path = try allocator.dupe(u8, entry_path),
+                    .root = Ref.fromRaw(raw_root),
+                    .size = entry_size,
+                    .chunk_buffer = try std.ArrayList(u8).initCapacity(allocator, Dag.MAX_CHUNK_SIZE),
+                    .rolling_hash = 0,
+                    .levels = try std.ArrayList(std.ArrayList(Ref)).initCapacity(allocator, 16),
+                    .dirty = false,
+                });
+            }
         }
     };
 }
