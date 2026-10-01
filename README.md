@@ -1,50 +1,57 @@
 # tfs
 
-A fast, content-deduplicating archive tool built on a binary Merkle tree.
+An experimental deduplicating archiver that organizes files into a binary Merkle tree.
+
+Instead of splitting data by fixed block sizes, it uses a rolling hash (FastCDC) to find content boundaries. When bytes are inserted or deleted, only the edited chunks change, so the rest of the file still matches and deduplicates.
 
 ---
 
-## What It's Good At
+## Properties
 
-- **Shift-proof deduplication**: Adding or deleting bytes in the middle of a file only affects that local segment. The rest of the file continues to deduplicate across revisions.
-- **Hierarchical sharing**: Identical data is reused at both the chunk level and the tree level—entire identical subtrees share storage.
-- **Instant seeks**: Reads any byte offset directly in $O(\log N)$ time without decompressing or streaming from the beginning.
-- **Pipe-ready**: Ingests from `stdin` and streams to `stdout` seamlessly.
+- **Shift-tolerant**: Inserting or deleting bytes does not break deduplication downstream.
+- **Tree-level reuse**: Identical chunk sequences share internal tree nodes, not just raw byte payloads.
+- **Direct seeks**: Reads arbitrary byte offsets in $O(log N)$ time using node weights, without linear scanning.
+- **Streaming**: Pipes to and from `stdin` and `stdout`.
+- **Limitation**: Chunks are stored uncompressed; space savings come purely from deduplication.
 
 ---
 
-## Quickstart
+## Build
 
-### Build
+Requires Zig 0.16.0+.
 
 ```bash
 zig build --release=fast
 ```
 
-### Happy Path
-
-```bash
-# 1. Archive a file
-tfs encode bundle.tfs data_v1.tar
-
-# 2. Add an updated version (only modified data uses new space)
-tfs encode bundle.tfs data_v2.tar
-
-# 3. Ingest directly from a pipe
-cat dump.sql | tfs encode bundle.tfs - --name dump.sql
-
-# 4. List stored files
-tfs list bundle.tfs
-
-# 5. Extract files
-tfs decode bundle.tfs data_v1.tar           # extracts to ./data_v1.tar
-tfs decode bundle.tfs data_v2.tar custom.tar # extracts to ./custom.tar
-tfs decode bundle.tfs dump.sql - | head -n 5 # streams to stdout
-```
+The binary will be in `zig-out/bin/tfs` (`tfs.exe` on Windows).
 
 ---
 
-## CLI Reference
+## Usage
+
+### Example
+
+```bash
+# Store a file
+tfs encode bundle.tfs data_v1.tar
+
+# Store an updated version (shares matching chunks with v1)
+tfs encode bundle.tfs data_v2.tar
+
+# Pipe into an archive
+cat dump.sql | tfs encode bundle.tfs - --name dump.sql
+
+# View contents
+tfs list bundle.tfs
+
+# Extract
+tfs decode bundle.tfs data_v1.tar
+tfs decode bundle.tfs data_v2.tar custom_name.tar
+tfs decode bundle.tfs dump.sql - | head -n 5
+```
+
+### Reference
 
 ```text
 Usage:

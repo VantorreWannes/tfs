@@ -583,7 +583,7 @@ pub fn FileSystem(
             try w.flush();
         }
 
-        pub fn loadFrom(self: *Self, io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, comptime rebuild_index: bool) !void {
+        pub fn loadFrom(self: *Self, io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, rebuild_index: bool) !void {
             const stat = try file.stat(io);
             if (stat.size == 0) return;
 
@@ -691,4 +691,127 @@ pub fn FileSystem(
             }
         }
     };
+}
+
+pub const DefaultFs = FileSystem(u32, 64);
+
+const c_allocator = std.heap.page_allocator;
+
+fn getIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+pub const TFS_OK: c_int = 0;
+pub const TFS_ERR_NULL: c_int = -1;
+pub const TFS_ERR_IO: c_int = -2;
+pub const TFS_ERR_OOM: c_int = -3;
+pub const TFS_ERR_NOT_FOUND: c_int = -4;
+
+export fn tfs_create() ?*DefaultFs {
+    const fs = c_allocator.create(DefaultFs) catch return null;
+    fs.* = DefaultFs.init(c_allocator) catch {
+        c_allocator.destroy(fs);
+        return null;
+    };
+    return fs;
+}
+
+export fn tfs_destroy(handle: ?*DefaultFs) void {
+    const fs = handle orelse return;
+    fs.deinit(c_allocator);
+    c_allocator.destroy(fs);
+}
+
+export fn tfs_prepare_entry(handle: ?*DefaultFs, path: ?[*:0]const u8) c_int {
+    const fs = handle orelse return TFS_ERR_NULL;
+    const raw_path = path orelse return TFS_ERR_NULL;
+    fs.prepareForEncode(c_allocator, std.mem.span(raw_path)) catch return TFS_ERR_OOM;
+    return TFS_OK;
+}
+
+export fn tfs_append(handle: ?*DefaultFs, path: ?[*:0]const u8, data: ?[*]const u8, len: usize) c_int {
+    const fs = handle orelse return TFS_ERR_NULL;
+    const raw_path = path orelse return TFS_ERR_NULL;
+    if (len == 0) return TFS_OK;
+    const slice = (data orelse return TFS_ERR_NULL)[0..len];
+    fs.appendSlice(c_allocator, std.mem.span(raw_path), slice) catch return TFS_ERR_OOM;
+    return TFS_OK;
+}
+
+export fn tfs_read(
+    handle: ?*DefaultFs,
+    path: ?[*:0]const u8,
+    offset: u64,
+    buf: ?[*]u8,
+    len: usize,
+    out_read: ?*usize,
+) c_int {
+    const fs = handle orelse return TFS_ERR_NULL;
+    const raw_path = path orelse return TFS_ERR_NULL;
+
+    if (len == 0) {
+        if (out_read) |r| r.* = 0;
+        return TFS_OK;
+    }
+
+    const dest = (buf orelse return TFS_ERR_NULL)[0..len];
+
+    const bytes_read = fs.read(c_allocator, std.mem.span(raw_path), offset, dest) catch |err| switch (err) {
+        error.FileNotFound => return TFS_ERR_NOT_FOUND,
+        else => return TFS_ERR_OOM,
+    };
+
+    if (out_read) |r| r.* = bytes_read;
+    return TFS_OK;
+}
+
+export fn tfs_size(handle: ?*DefaultFs, path: ?[*:0]const u8, out_size: ?*u64) c_int {
+    const fs = handle orelse return TFS_ERR_NULL;
+    const raw_path = path orelse return TFS_ERR_NULL;
+    const size_val = (fs.size(c_allocator, std.mem.span(raw_path)) catch return TFS_ERR_OOM) orelse return TFS_ERR_NOT_FOUND;
+    if (out_size) |s| s.* = size_val;
+    return TFS_OK;
+}
+
+export fn tfs_save(handle: ?*DefaultFs, archive_path: ?[*:0]const u8) c_int {
+    const fs = handle orelse return TFS_ERR_NULL;
+    const raw_path = archive_path orelse return TFS_ERR_NULL;
+    const path_slice = std.mem.span(raw_path);
+    const io = getIo();
+    const cwd = std.Io.Dir.cwd();
+
+    if (std.fs.path.dirname(path_slice)) |parent| {
+        cwd.createDirPath(io, parent) catch {};
+    }
+
+    var file = cwd.createFile(io, path_slice, .{ .truncate = true, .lock = .none }) catch return TFS_ERR_IO;
+    defer file.close(io);
+
+    fs.writeTo(io, c_allocator, file) catch return TFS_ERR_IO;
+    return TFS_OK;
+}
+
+export fn tfs_load(handle: ?*DefaultFs, archive_path: ?[*:0]const u8, rebuild_index: bool) c_int {
+    const fs = handle orelse return TFS_ERR_NULL;
+    const raw_path = archive_path orelse return TFS_ERR_NULL;
+    const path_slice = std.mem.span(raw_path);
+    const io = getIo();
+    const cwd = std.Io.Dir.cwd();
+
+    var file = cwd.openFile(io, path_slice, .{ .mode = .read_only, .lock = .none }) catch return TFS_ERR_IO;
+    defer file.close(io);
+
+    fs.loadFrom(io, c_allocator, file, rebuild_index) catch return TFS_ERR_IO;
+    return TFS_OK;
+}
+
+export fn tfs_entry_count(handle: ?*DefaultFs) usize {
+    const fs = handle orelse return 0;
+    return fs.entries.items.len;
+}
+
+export fn tfs_entry_name(handle: ?*DefaultFs, index: usize) ?[*:0]const u8 {
+    const fs = handle orelse return null;
+    if (index >= fs.entries.items.len) return null;
+    return @ptrCast(fs.entries.items[index].path.ptr);
 }
