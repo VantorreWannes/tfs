@@ -1,6 +1,6 @@
 .{
     .name = .tfs,
-    .version = "0.0.1",
+    .version = "0.1.0",
     .dependencies = .{
         .zbench = .{
             .url = "https://github.com/hendriknielaender/zbench/archive/c24d128bfa80ec6a1b495b84ec827c6a0bec7865.tar.gz",

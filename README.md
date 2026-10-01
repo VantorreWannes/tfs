@@ -10,8 +10,9 @@ Instead of splitting data by fixed block sizes, it uses a rolling hash (FastCDC)
 
 - **Shift-tolerant**: Inserting or deleting bytes does not break deduplication downstream.
 - **Tree-level reuse**: Identical chunk sequences share internal tree nodes, not just raw byte payloads.
-- **Direct seeks**: Reads arbitrary byte offsets in $O(log N)$ time using node weights, without linear scanning.
+- **Direct seeks**: Reads arbitrary byte offsets in $O(\log N)$ time using node weights, without linear scanning.
 - **Streaming**: Pipes to and from `stdin` and `stdout`.
+- **On-demand mounting**: Mounts archives as read-only directories via Windows ProjFS, reading chunks dynamically without extracting the archive.
 - **Limitation**: Chunks are stored uncompressed; space savings come purely from deduplication.
 
 ---
@@ -49,6 +50,9 @@ tfs list bundle.tfs
 tfs decode bundle.tfs data_v1.tar
 tfs decode bundle.tfs data_v2.tar custom_name.tar
 tfs decode bundle.tfs dump.sql - | head -n 5
+
+# Mount as a virtual directory (Windows ProjFS)
+tfs mount bundle.tfs ./mnt
 ```
 
 ### Reference
@@ -58,4 +62,5 @@ Usage:
   tfs encode <archive> [input|-]    [--name <entry_name>]
   tfs decode <archive> <entry_name> [output|-]
   tfs list   <archive>
+  tfs mount  <archive> <directory>  (Windows ProjFS)
 ```

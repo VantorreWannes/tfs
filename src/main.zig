@@ -1,5 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const tfs = @import("root.zig");
+const projfs = @import("projfs.zig");
 
 pub fn Cli(
     comptime Index: type,
@@ -13,6 +15,7 @@ pub fn Cli(
             encode,
             decode,
             list,
+            mount,
         };
 
         pub const Options = struct {
@@ -65,11 +68,13 @@ pub fn Cli(
                             output_path = positional[2] orelse entry_name;
                         } else {
                             entry_name = positional[2] orelse return error.MissingEntryName;
-                            // Default to extracting with the original entry name if output path is omitted
                             output_path = positional[3] orelse entry_name;
                         }
                     },
                     .list => {},
+                    .mount => {
+                        output_path = positional[2] orelse return error.MissingMountFolder;
+                    },
                 }
 
                 return .{
@@ -88,13 +93,7 @@ pub fn Cli(
                 \\  tfs encode <archive> [input|-]    [--name <entry_name>]
                 \\  tfs decode <archive> <entry_name> [output|-]
                 \\  tfs list   <archive>
-                \\
-                \\Examples:
-                \\  tfs encode bundle.tfs data.txt
-                \\  tfs list   bundle.tfs
-                \\  tfs decode bundle.tfs data.txt              # extracts to ./data.txt
-                \\  tfs decode bundle.tfs data.txt restored.txt # extracts to ./restored.txt
-                \\  tfs decode bundle.tfs data.txt -            # streams to stdout
+                \\  tfs mount  <archive> <directory>  (Windows ProjFS)
                 \\
             );
         }
@@ -196,6 +195,90 @@ pub fn Cli(
                         });
                     }
                     try stdout_writer.interface.flush();
+                },
+                .mount => {
+                    if (builtin.os.tag != .windows) {
+                        std.debug.print("Error: 'mount' is only supported on Windows with ProjFS.\n", .{});
+                        return error.UnsupportedPlatform;
+                    }
+
+                    var archive_existed = false;
+                    if (cwd.openFile(io, options.archive_path, .{ .mode = .read_only, .lock = .none })) |archive_file| {
+                        defer archive_file.close(io);
+                        try fs.loadFrom(io, allocator, archive_file, false);
+                        archive_existed = true;
+                    } else |err| switch (err) {
+                        error.FileNotFound => {
+                            std.debug.print("Archive '{s}' does not exist. Creating new archive...\n", .{options.archive_path});
+                        },
+                        else => return err,
+                    }
+
+                    const mount_dir = options.output_path.?;
+                    try cwd.createDirPath(io, mount_dir);
+
+                    try projfs.mount(allocator, &fs, mount_dir);
+
+                    var new_count: usize = 0;
+                    if (cwd.openDir(io, mount_dir, .{ .iterate = true })) |mut_dir| {
+                        var dir = mut_dir;
+                        defer dir.close(io);
+
+                        var walker = try dir.walk(allocator);
+                        defer walker.deinit();
+
+                        while (try walker.next(io)) |entry| {
+                            if (entry.kind != .file) continue;
+
+                            var norm_buf: [512]u8 = undefined;
+                            const norm_len = @min(norm_buf.len, entry.path.len);
+                            for (entry.path[0..norm_len], 0..) |c, idx| {
+                                norm_buf[idx] = if (c == '\\') '/' else c;
+                            }
+                            const rel_name = norm_buf[0..norm_len];
+
+                            if (fs.findEntry(rel_name) == null) {
+                                std.debug.print("Saving new file: {s}...\n", .{rel_name});
+                                try fs.prepareForEncode(allocator, rel_name);
+                                const active_path = fs.active_entry.?.path;
+
+                                var disk_file = try dir.openFile(io, entry.path, .{ .mode = .read_only, .lock = .none });
+                                defer disk_file.close(io);
+
+                                var stream_buf: [IoBufferSize]u8 = undefined;
+                                var reader = disk_file.reader(io, &stream_buf);
+                                var read_chunk: [IoBufferSize]u8 = undefined;
+
+                                while (true) {
+                                    const n = try reader.interface.readSliceShort(&read_chunk);
+                                    if (n == 0) break;
+                                    try fs.appendSlice(allocator, active_path, read_chunk[0..n]);
+                                }
+                                new_count += 1;
+                            }
+                        }
+
+                        if (new_count > 0 or archive_existed) {
+                            var it = dir.iterate();
+                            while (try it.next(io)) |entry| {
+                                if (entry.kind == .directory) {
+                                    dir.deleteTree(io, entry.name) catch {};
+                                } else {
+                                    dir.deleteFile(io, entry.name) catch {};
+                                }
+                            }
+                        }
+                    } else |_| {}
+
+                    if (archive_existed or new_count > 0) {
+                        var archive_output = try cwd.createFile(io, options.archive_path, .{
+                            .truncate = true,
+                            .lock = .none,
+                        });
+                        defer archive_output.close(io);
+                        try fs.writeTo(io, allocator, archive_output);
+                        std.debug.print("Persisted archive '{s}' ({d} new files).\n", .{ options.archive_path, new_count });
+                    }
                 },
             }
         }
