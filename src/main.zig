@@ -1,11 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const tfs = @import("root.zig");
+const tfs = @import("tfs");
 const projfs = @import("projfs.zig");
+const fuse = @import("fuse.zig");
 
 const Store = tfs.SpanStore(u32);
 const FileContent = tfs.BuildResult(u32);
 const io_buffer_size = 128 * 1024;
+
+fn serializedSize(comptime T: type) comptime_int {
+    return switch (@typeInfo(T)) {
+        .int => |int| @divExact(int.bits, 8),
+        .array => |array| array.len * serializedSize(array.child),
+        else => @compileError("serializedSize: expected an integer or integer array"),
+    };
+}
 
 fn writeInt(writer: *std.Io.Writer, comptime T: type, value: T) !void {
     var bytes: [@divExact(@bitSizeOf(T), 8)]u8 = undefined;
@@ -17,19 +26,6 @@ fn readInt(reader: *std.Io.Reader, comptime T: type) !T {
     var bytes: [@divExact(@bitSizeOf(T), 8)]u8 = undefined;
     try reader.readSliceAll(&bytes);
     return std.mem.readInt(T, &bytes, .little);
-}
-
-fn skipBytes(reader: *std.Io.Reader, count: u64) !void {
-    var remaining = count;
-    var discarded: [64 * 1024]u8 = undefined;
-
-    while (remaining != 0) {
-        const amount: usize = @intCast(@min(remaining, discarded.len));
-        const read = try reader.readSliceShort(discarded[0..amount]);
-
-        if (read == 0) return error.UnexpectedEof;
-        remaining -= read;
-    }
 }
 
 const Names = struct {
@@ -147,9 +143,10 @@ const Names = struct {
         }
     }
 };
+
 pub const Archive = struct {
     const magic = "TFS5";
-    const footer_size = magic.len + @sizeOf(u64);
+    const footer_size = magic.len + serializedSize(u64);
 
     const Frame = struct {
         ref: u32,
@@ -217,15 +214,26 @@ pub const Archive = struct {
         return self.entries.items[index].content;
     }
 
-    pub fn entryAt(self: *const Archive, index: usize) ?projfs.Entry {
+    pub fn entryAt(self: *const Archive, index: usize) ?Entry {
         if (index >= self.entries.items.len) return null;
 
-        const entry = self.entries.items[index];
+        return self.entries.items[index];
+    }
 
-        return .{
-            .path = entry.path,
-            .content = entry.content,
-        };
+    fn conflictsWith(
+        self: *const Archive,
+        path: []const u8,
+        except: ?usize,
+    ) bool {
+        for (self.entries.items, 0..) |entry, index| {
+            if (except) |kept| {
+                if (index == kept) continue;
+            }
+
+            if (Names.conflicts(entry.path, path)) return true;
+        }
+
+        return false;
     }
 
     fn putAt(
@@ -238,11 +246,8 @@ pub const Archive = struct {
 
         const existing = self.indexOf(path);
 
-        for (self.entries.items, 0..) |entry, index| {
-            if (existing != null and index == existing.?) continue;
-            if (Names.conflicts(entry.path, path)) {
-                return error.NamespaceConflict;
-            }
+        if (self.conflictsWith(path, existing)) {
+            return error.NamespaceConflict;
         }
 
         const allocator = self.store.allocator;
@@ -655,16 +660,21 @@ pub const Archive = struct {
         offsets_len: usize,
         pairs_len: usize,
     ) u64 {
-        var size: u64 = 4 + 8 + 8 + 8 + 4 + 4 + 4;
+        var size: u64 = magic.len +
+            serializedSize(u64) * 3 + // seed, chunk span, payload length
+            serializedSize(u32) * 3; // leaf, pair, and entry counts
 
-        size += @as(u64, offsets_len) * 8;
-        size += @as(u64, pairs_len) * 8;
+        size += @as(u64, offsets_len) * serializedSize(u64);
+        size += @as(u64, pairs_len) * serializedSize([2]u32);
 
         for (self.entries.items) |entry| {
-            size += 2 + @as(u64, entry.path.len) + 1 + 8 +
-                @divExact(@bitSizeOf(i96), 8);
+            size += serializedSize(u16) + // path length
+                @as(u64, entry.path.len) +
+                serializedSize(u8) + // present flag
+                serializedSize(u64) + // byte_count
+                serializedSize(i96); // timestamp
 
-            if (entry.content.root != null) size += 4;
+            if (entry.content.root != null) size += serializedSize(u32);
         }
 
         return size;
@@ -716,6 +726,11 @@ pub const Archive = struct {
         return trailer_size;
     }
 
+    fn writeFooter(writer: *std.Io.Writer, trailer_size: u64) !void {
+        try writeInt(writer, u64, trailer_size);
+        try writer.writeAll(magic);
+    }
+
     pub fn writeImage(self: *const Archive, writer: *std.Io.Writer) !void {
         const payload_len: u64 = self.store.bytes.items.len;
 
@@ -728,8 +743,7 @@ pub const Archive = struct {
             payload_len,
         );
 
-        try writeInt(writer, u64, trailer_size);
-        try writer.writeAll(magic);
+        try writeFooter(writer, trailer_size);
     }
 
     pub fn parseTrailer(self: *Archive, bytes: []const u8) !void {
@@ -839,7 +853,10 @@ pub const Archive = struct {
                 const timestamp = try readInt(&reader, i96);
 
                 try Names.validate(path);
-                if (self.find(path) != null) return error.InvalidArchiveFormat;
+
+                if (self.conflictsWith(path, null)) {
+                    return error.InvalidArchiveFormat;
+                }
 
                 try self.entries.append(allocator, .{
                     .path = path,
@@ -871,11 +888,11 @@ pub const Archive = struct {
 
         const trailer_size = std.mem.readInt(
             u64,
-            footer[0..@sizeOf(u64)],
+            footer[0..serializedSize(u64)],
             .little,
         );
 
-        if (!std.mem.eql(u8, footer[@sizeOf(u64)..], magic)) {
+        if (!std.mem.eql(u8, footer[serializedSize(u64)..], magic)) {
             return error.InvalidArchiveFormat;
         }
 
@@ -1117,8 +1134,7 @@ fn saveArchive(
             archive.payload_len,
         );
 
-        try writeInt(&writer.interface, u64, trailer_size);
-        try writer.interface.writeAll(Archive.magic);
+        try Archive.writeFooter(&writer.interface, trailer_size);
     }
 
     try writer.interface.flush();
@@ -1333,31 +1349,54 @@ fn mountArchive(
     archive_path: []const u8,
     directory: []const u8,
 ) !void {
-    if (builtin.os.tag != .windows) {
-        return error.UnsupportedPlatform;
-    }
-
-    const allocator = archive.store.allocator;
     const cwd = std.Io.Dir.cwd();
 
-    try cwd.createDir(
-        io,
-        directory,
-        @enumFromInt(0x00000080),
-    );
+    switch (builtin.os.tag) {
+        .windows => {
+            try cwd.createDir(io, directory, @enumFromInt(0x00000080));
 
-    var instance_id: projfs.InstanceId = undefined;
-    io.random(std.mem.asBytes(&instance_id));
+            var instance_id: projfs.InstanceId = undefined;
+            io.random(std.mem.asBytes(&instance_id));
 
-    try projfs.markDirectory(allocator, directory, &instance_id);
+            try projfs.markDirectory(
+                archive.store.allocator,
+                directory,
+                &instance_id,
+            );
 
-    const mounted = try projfs.Mount(Archive).start(
-        allocator,
-        archive,
-        directory,
-        WindowsFiles.load,
-    );
+            const mounted = try projfs.Mount(Archive).start(
+                archive.store.allocator,
+                archive,
+                directory,
+                WindowsFiles.load,
+            );
 
+            try runMountSession(io, archive, archive_path, directory, mounted);
+        },
+
+        .linux => {
+            try cwd.createDirPath(io, directory);
+
+            const mounted = try fuse.Mount(Archive).start(
+                archive.store.allocator,
+                archive,
+                directory,
+            );
+
+            try runMountSession(io, archive, archive_path, directory, mounted);
+        },
+
+        else => return error.UnsupportedPlatform,
+    }
+}
+
+fn runMountSession(
+    io: std.Io,
+    archive: *Archive,
+    archive_path: []const u8,
+    directory: []const u8,
+    mounted: anytype,
+) !void {
     var active = true;
     defer if (active) {
         _ = mounted.stop();
@@ -1382,16 +1421,10 @@ fn mountArchive(
     const read_error: ?anyerror = if (wait_result) |_| null else |err| err;
 
     if (read_error == null and notification_error == null) {
-        if (cwd.deleteTree(io, directory)) {
-            std.debug.print(
-                "[unmount] Removed mount directory '{s}'.\n",
-                .{directory},
-            );
+        if (std.Io.Dir.cwd().deleteTree(io, directory)) {
+            std.debug.print("[unmount] Removed mount directory '{s}'.\n", .{directory});
         } else |err| {
-            std.debug.print(
-                "[warn] Could not remove '{s}' ({s}). A background process (Defender/Explorer) may still hold it; delete it manually once handles release.\n",
-                .{ directory, @errorName(err) },
-            );
+            std.debug.print("[warn] Could not remove '{s}' ({s}).\n", .{ directory, @errorName(err) });
         }
     } else {
         std.debug.print(
@@ -1414,7 +1447,10 @@ pub fn execute(
     allocator: std.mem.Allocator,
     options: Options,
 ) !void {
-    if (options == .mount and builtin.os.tag != .windows) {
+    if (options == .mount and
+        builtin.os.tag != .windows and
+        builtin.os.tag != .linux)
+    {
         return error.UnsupportedPlatform;
     }
 
@@ -1540,7 +1576,7 @@ pub fn printUsage(io: std.Io) !void {
         \\  tfs list   <archive>
         \\  tfs mount  <archive> <new-directory>
         \\
-        \\Mount requires Windows ProjFS.
+        \\Mount requires Linux FUSE or Windows ProjFS.
         \\Press Enter to stop a mount, save, and remove the mount directory.
         \\
     );

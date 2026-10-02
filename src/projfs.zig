@@ -1,16 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const content = @import("root.zig");
-
-const Store = content.SpanStore(u32);
-const File = content.BuildResult(u32);
 
 pub const InstanceId = std.os.windows.GUID;
-
-pub const Entry = struct {
-    path: []const u8,
-    content: File,
-};
 
 pub const LoadFile = *const fn (
     allocator: std.mem.Allocator,
@@ -21,63 +12,6 @@ const Platform = if (builtin.os.tag == .windows) Windows else Unsupported;
 
 pub const Mount = Platform.Mount;
 pub const markDirectory = Platform.markDirectory;
-
-pub const SpanReader = struct {
-    iterator: Store.LeafIterator,
-    remaining: []const u8 = "",
-
-    pub fn init(store: *const Store, root: ?u32) SpanReader {
-        return .{ .iterator = store.leaves(root) };
-    }
-
-    pub fn deinit(self: *SpanReader) void {
-        self.iterator.deinit();
-    }
-
-    fn fill(self: *SpanReader) !bool {
-        while (self.remaining.len == 0) {
-            self.remaining = (try self.iterator.next()) orelse return false;
-        }
-        return true;
-    }
-
-    pub fn skip(self: *SpanReader, count: u64) !u64 {
-        var remaining = count;
-
-        while (remaining != 0 and try self.fill()) {
-            const amount: usize = @intCast(@min(
-                remaining,
-                @as(u64, @intCast(self.remaining.len)),
-            ));
-
-            self.remaining = self.remaining[amount..];
-            remaining -= amount;
-        }
-
-        return count - remaining;
-    }
-
-    pub fn read(self: *SpanReader, output: []u8) !usize {
-        var written: usize = 0;
-
-        while (written < output.len and try self.fill()) {
-            const amount = @min(
-                output.len - written,
-                self.remaining.len,
-            );
-
-            @memcpy(
-                output[written..][0..amount],
-                self.remaining[0..amount],
-            );
-
-            self.remaining = self.remaining[amount..];
-            written += amount;
-        }
-
-        return written;
-    }
-};
 
 fn archivePath(
     allocator: std.mem.Allocator,
@@ -146,17 +80,12 @@ const Unsupported = struct {
                 _: std.mem.Allocator,
                 _: *Archive,
                 _: []const u8,
-                _: u64,
                 _: LoadFile,
             ) error{UnsupportedPlatform}!*Self {
                 return error.UnsupportedPlatform;
             }
 
             pub fn stop(_: *Self) ?anyerror {
-                unreachable;
-            }
-
-            pub fn takeNotificationError(_: *Self) ?anyerror {
                 unreachable;
             }
         };
@@ -737,16 +666,6 @@ const Windows = struct {
                 return notification_error;
             }
 
-            pub fn takeNotificationError(self: *Self) ?anyerror {
-                AcquireSRWLockExclusive(&self.lock);
-                defer ReleaseSRWLockExclusive(&self.lock);
-
-                const result = self.notification_error;
-                self.notification_error = null;
-
-                return result;
-            }
-
             fn recordNotificationError(self: *Self, err: anyerror) void {
                 AcquireSRWLockExclusive(&self.lock);
                 defer ReleaseSRWLockExclusive(&self.lock);
@@ -1063,6 +982,8 @@ const Windows = struct {
                     return error.NotFound;
                 };
 
+                const root = entry.root orelse return 0;
+
                 if (length == 0 or offset >= entry.byte_count) return 0;
 
                 var instance = std.mem.zeroes(VirtualizationInstanceInfo);
@@ -1106,16 +1027,6 @@ const Windows = struct {
 
                 const bytes = @as([*]u8, @ptrCast(allocation))[0..capacity];
 
-                var reader = SpanReader.init(
-                    &self.archive.store,
-                    entry.root,
-                );
-                defer reader.deinit();
-
-                if (try reader.skip(position) != position) {
-                    return error.UnexpectedEndOfContent;
-                }
-
                 while (position < end) {
                     const count: usize = @intCast(@min(
                         @as(u64, @intCast(bytes.len)),
@@ -1123,7 +1034,7 @@ const Windows = struct {
                     ));
 
                     const read_count = try self.archive.readRange(
-                        entry.root.?,
+                        root,
                         position,
                         bytes[0..count],
                     );
@@ -1257,67 +1168,6 @@ const Windows = struct {
     }
 };
 
-test "SpanReader" {
-    const allocator = std.testing.allocator;
-
-    {
-        var store = Store.init(allocator);
-        defer store.deinit();
-
-        var reader = SpanReader.init(&store, null);
-        defer reader.deinit();
-
-        var output: [4]u8 = undefined;
-
-        try std.testing.expectEqual(@as(u64, 0), try reader.skip(10));
-        try std.testing.expectEqual(@as(usize, 0), try reader.read(&output));
-    }
-
-    {
-        var store = Store.init(allocator);
-        defer store.deinit();
-
-        const a = try store.internBytes("abc");
-        const empty = try store.internBytes("");
-        const b = try store.internBytes("defg");
-
-        const left = try store.internPair(a.id, empty.id);
-        const root = try store.internPair(left, b.id);
-
-        var reader = SpanReader.init(&store, root);
-        defer reader.deinit();
-
-        try std.testing.expectEqual(@as(u64, 2), try reader.skip(2));
-
-        var output: [4]u8 = undefined;
-
-        try std.testing.expectEqual(@as(usize, 4), try reader.read(&output));
-        try std.testing.expectEqualSlices(u8, "cdef", &output);
-
-        try std.testing.expectEqual(@as(u64, 1), try reader.skip(100));
-        try std.testing.expectEqual(@as(usize, 0), try reader.read(&output));
-    }
-
-    {
-        var store = Store.init(allocator);
-        defer store.deinit();
-
-        const leaf = try store.internBytes("abc");
-
-        var reader = SpanReader.init(&store, leaf.id);
-        defer reader.deinit();
-
-        var empty: [0]u8 = .{};
-        try std.testing.expectEqual(@as(usize, 0), try reader.read(&empty));
-
-        var output: [8]u8 = undefined;
-        const count = try reader.read(&output);
-
-        try std.testing.expectEqual(@as(usize, 3), count);
-        try std.testing.expectEqualSlices(u8, "abc", output[0..count]);
-    }
-}
-
 test "archivePath" {
     const allocator = std.testing.allocator;
 
@@ -1409,30 +1259,27 @@ test "joinPath" {
 
 test "Mount" {
     if (builtin.os.tag != .windows) {
-        {
-            const Archive = struct {};
-            var archive: Archive = .{};
+        const Archive = struct {};
+        var archive: Archive = .{};
 
-            const Loader = struct {
-                fn load(
-                    _: std.mem.Allocator,
-                    _: [:0]const u16,
-                ) anyerror![]u8 {
-                    return error.LoaderMustNotBeCalled;
-                }
-            };
+        const Loader = struct {
+            fn load(
+                _: std.mem.Allocator,
+                _: [:0]const u16,
+            ) anyerror![]u8 {
+                return error.LoaderMustNotBeCalled;
+            }
+        };
 
-            try std.testing.expectError(
-                error.UnsupportedPlatform,
-                Mount(Archive).start(
-                    std.testing.allocator,
-                    &archive,
-                    "unused",
-                    0,
-                    Loader.load,
-                ),
-            );
-        }
+        try std.testing.expectError(
+            error.UnsupportedPlatform,
+            Mount(Archive).start(
+                std.testing.allocator,
+                &archive,
+                "unused",
+                Loader.load,
+            ),
+        );
     } else {
         return error.SkipZigTest;
     }
@@ -1440,18 +1287,16 @@ test "Mount" {
 
 test "markDirectory" {
     if (builtin.os.tag != .windows) {
-        {
-            const instance_id = std.mem.zeroes(InstanceId);
+        const instance_id = std.mem.zeroes(InstanceId);
 
-            try std.testing.expectError(
-                error.UnsupportedPlatform,
-                markDirectory(
-                    std.testing.allocator,
-                    "unused",
-                    &instance_id,
-                ),
-            );
-        }
+        try std.testing.expectError(
+            error.UnsupportedPlatform,
+            markDirectory(
+                std.testing.allocator,
+                "unused",
+                &instance_id,
+            ),
+        );
     } else {
         return error.SkipZigTest;
     }

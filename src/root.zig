@@ -81,6 +81,29 @@ fn IdTable(comptime Index: type) type {
             self.controls[slot] = fingerprint(hash);
         }
 
+        fn claim(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            count: usize,
+            hash: u64,
+            key: anytype,
+            context: anytype,
+        ) !Probe {
+            var slot = switch (self.probe(hash, key, context)) {
+                .found => |id| return .{ .found = id },
+                .vacant => |vacant| vacant,
+            };
+
+            if (try self.reserve(allocator, count + 1, context)) {
+                slot = switch (self.probe(hash, key, context)) {
+                    .found => unreachable,
+                    .vacant => |vacant| vacant,
+                };
+            }
+
+            return .{ .vacant = slot };
+        }
+
         fn reserve(
             self: *Self,
             allocator: std.mem.Allocator,
@@ -280,23 +303,18 @@ pub fn SpanStore(comptime Index: type) type {
             const hash = hashBytes(bytes);
             const context = ByteContext{ .store = self };
 
-            var slot = switch (self.byte_index.probe(hash, bytes, context)) {
-                .found => |id| return .{ .id = id, .hash = hash },
+            const slot = switch (try self.byte_index.claim(
+                self.allocator,
+                self.offsets.items.len,
+                hash,
+                bytes,
+                context,
+            )) {
+                .found => |existing| return .{ .id = existing, .hash = hash },
                 .vacant => |vacant| vacant,
             };
 
             const id = try nextIndex(self.offsets.items.len);
-
-            if (try self.byte_index.reserve(
-                self.allocator,
-                self.offsets.items.len + 1,
-                context,
-            )) {
-                slot = switch (self.byte_index.probe(hash, bytes, context)) {
-                    .found => unreachable,
-                    .vacant => |vacant| vacant,
-                };
-            }
 
             try self.offsets.ensureUnusedCapacity(self.allocator, 1);
             try self.bytes.ensureUnusedCapacity(self.allocator, bytes.len);
@@ -313,23 +331,18 @@ pub fn SpanStore(comptime Index: type) type {
             const hash = hashPair(pair);
             const context = PairContext{ .store = self };
 
-            var slot = switch (self.pair_index.probe(hash, pair, context)) {
-                .found => |id| return id,
+            const slot = switch (try self.pair_index.claim(
+                self.allocator,
+                self.pairs.items.len,
+                hash,
+                pair,
+                context,
+            )) {
+                .found => |existing| return existing,
                 .vacant => |vacant| vacant,
             };
 
             const id = (try nextIndex(self.pairs.items.len)) | pair_flag;
-
-            if (try self.pair_index.reserve(
-                self.allocator,
-                self.pairs.items.len + 1,
-                context,
-            )) {
-                slot = switch (self.pair_index.probe(hash, pair, context)) {
-                    .found => unreachable,
-                    .vacant => |vacant| vacant,
-                };
-            }
 
             try self.pairs.ensureUnusedCapacity(self.allocator, 1);
 
@@ -342,18 +355,18 @@ pub fn SpanStore(comptime Index: type) type {
         pub fn reindex(self: *Self) !void {
             const byte_context = ByteContext{ .store = self };
 
-            _ = try self.byte_index.reserve(
-                self.allocator,
-                self.offsets.items.len + 1,
-                byte_context,
-            );
-
             for (0..self.offsets.items.len) |i| {
                 const id: Index = @intCast(i);
                 const bytes = self.readBytes(id);
                 const hash = hashBytes(bytes);
 
-                const slot = switch (self.byte_index.probe(hash, bytes, byte_context)) {
+                const slot = switch (try self.byte_index.claim(
+                    self.allocator,
+                    self.offsets.items.len,
+                    hash,
+                    bytes,
+                    byte_context,
+                )) {
                     .found => continue,
                     .vacant => |vacant| vacant,
                 };
@@ -363,18 +376,18 @@ pub fn SpanStore(comptime Index: type) type {
 
             const pair_context = PairContext{ .store = self };
 
-            _ = try self.pair_index.reserve(
-                self.allocator,
-                self.pairs.items.len + 1,
-                pair_context,
-            );
-
             for (0..self.pairs.items.len) |i| {
                 const id = @as(Index, @intCast(i)) | pair_flag;
                 const pair = self.pairs.items[i];
                 const hash = hashPair(pair);
 
-                const slot = switch (self.pair_index.probe(hash, pair, pair_context)) {
+                const slot = switch (try self.pair_index.claim(
+                    self.allocator,
+                    self.pairs.items.len,
+                    hash,
+                    pair,
+                    pair_context,
+                )) {
                     .found => continue,
                     .vacant => |vacant| vacant,
                 };
