@@ -1,18 +1,17 @@
 # tfs
 
-An experimental deduplicating archiver that organizes files into a binary Merkle tree.
+An experimental deduplicating filesystem-in-a-file that stores content in a hash tree.
 
-Instead of splitting data by fixed block sizes, it uses a rolling hash (FastCDC) to find content boundaries. When bytes are inserted or deleted, only the edited chunks change, so the rest of the file still matches and deduplicates.
+Content is split into fixed-size words (256 bytes). Each distinct word is stored once and referenced by hash; parent nodes store the hashes of their children, so identical word sequences share whole subtrees as well as raw words.
 
 ---
 
 ## Properties
 
-- **Shift-tolerant**: Inserting or deleting bytes does not break deduplication downstream.
-- **Tree-level reuse**: Identical chunk sequences share internal tree nodes, not just raw byte payloads.
-- **Streaming**: Pipes to and from `stdin` and `stdout`.
-- **On-demand mounting**: Mounts archives as virtual directories via Windows ProjFS, reading chunks dynamically without extracting the archive and indexing newly written files live.
-- **Limitation**: Chunks are stored uncompressed; space savings come purely from deduplication.
+- **Content-addressed**: identical words and identical word sequences are stored once.
+- **Streaming**: pipes to and from `stdin` and `stdout`.
+- **On-demand mounting**: mounts stores as virtual directories via Windows ProjFS, reading content dynamically without extracting it, and capturing modified files back into the store.
+- **Limitation**: content is stored uncompressed; space savings come purely from deduplication. Files are limited to 1 GiB.
 
 ---
 
@@ -33,33 +32,48 @@ The binary will be in `zig-out/bin/tfs` (`tfs.exe` on Windows).
 ### Example
 
 ```bash
-# Store a file
-tfs encode bundle.tfs data_v1.tar
+tfs put bundle.tfs data_v1.tar
 
-# Store an updated version (shares matching chunks with v1)
-tfs encode bundle.tfs data_v2.tar
+tfs put bundle.tfs data_v2.tar
 
-# Pipe into an archive
-cat dump.sql | tfs encode bundle.tfs - --name dump.sql
+cat dump.sql | tfs put bundle.tfs -   # stdin input is stored under the name "-"
 
-# View contents
-tfs list bundle.tfs
+tfs ls bundle.tfs
+tfs ls bundle.tfs docs
 
-# Extract
-tfs decode bundle.tfs data_v1.tar
-tfs decode bundle.tfs data_v2.tar custom_name.tar
-tfs decode bundle.tfs dump.sql - | head -n 5
+tfs get bundle.tfs data_v1.tar
+tfs get bundle.tfs data_v2.tar custom_name.tar
+tfs get bundle.tfs data_v1.tar - | head -n 5
 
-# Mount as a virtual directory (Windows ProjFS)
 tfs mount bundle.tfs ./mnt
 ```
 
 ### Reference
 
 ```text
-Usage:
-  tfs encode <archive> [input|-]    [--name <entry_name>]
-  tfs decode <archive> <entry_name> [output|-]
-  tfs list   <archive>
-  tfs mount  <archive> <directory>  (Windows ProjFS)
+usage:
+  tfs put <store> <file>          store a file into the filesystem
+  tfs get <store> <path> [out]    extract a file (out "-" = stdout)
+  tfs ls <store> [path]           list a directory
+  tfs mount <store> <dir>         mount as a virtual directory (Windows ProjFS)
+
+  <store>  data file; index kept beside it as <store>.idx,
+           namespace snapshot as <store>.ns
+  <path>   path inside the filesystem, e.g. docs/notes/a.txt
 ```
+
+### Mounting
+
+`mount` projects the store into a local directory via Windows ProjFS. Files are
+hydrated on demand, and files modified through the mount are captured back into
+the store while it is mounted.
+
+On unmount (Ctrl+C), pending captures are drained and committed before cleanup.
+Cleanup visits only paths in the committed namespace: clean ProjFS placeholders
+and files verified byte-for-byte against the store are removed, followed by
+empty known directories. The mount root itself remains.
+
+Unknown paths, changed or busy files, read-only files, links/junctions, and files
+with alternate data streams are retained. If capture or commit fails, cleanup is
+skipped. The command reports incomplete cleanup rather than silently deleting
+unverified data; verify retained files before removing them manually.
