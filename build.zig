@@ -15,9 +15,11 @@ const dist_targets = [_]DistTarget{
 };
 
 pub fn build(b: *std.Build) void {
+    // Options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Modules
     const root_mod = b.addModule("tfs", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -34,6 +36,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Libraries
     const root_lib = b.addLibrary(.{
         .name = "tfs",
         .linkage = .dynamic,
@@ -41,85 +44,77 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
 
+    // Directories
     const docs_dir = b.addInstallDirectory(.{
         .source_dir = root_lib.getEmittedDocs(),
         .install_dir = .prefix,
         .install_subdir = "docs",
     });
 
+    // Binaries
     const main_bin = b.addExecutable(.{
         .name = "tfs",
         .root_module = main_mod,
         .use_llvm = true,
     });
 
-    const root_test_bin = b.addTest(.{
-        .name = "root_tests",
-        .root_module = root_mod,
-        .use_llvm = true,
-    });
-
-    const main_test_bin = b.addTest(.{
-        .name = "main_tests",
-        .root_module = main_mod,
-        .use_llvm = true,
-    });
-
+    // Commands
     const run_cmd = b.addRunArtifact(main_bin);
-    const test_root_cmd = b.addRunArtifact(root_test_bin);
-    const test_main_cmd = b.addRunArtifact(main_test_bin);
-
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-
     run_cmd.step.dependOn(b.getInstallStep());
 
-    const run_step = b.step("run", "Run the app");
-    run_step.dependOn(&run_cmd.step);
+    // Steps - Run
+    b.step("run", "Run the app").dependOn(&run_cmd.step);
 
+    // Steps - Tests
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&test_main_cmd.step);
-    test_step.dependOn(&test_root_cmd.step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        .name = "root_tests",
+        .root_module = root_mod,
+        .use_llvm = true,
+    })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        .name = "main_tests",
+        .root_module = main_mod,
+        .use_llvm = true,
+    })).step);
 
-    const docs_step = b.step("docs", "Install docs into zig-out/docs");
-    docs_step.dependOn(&docs_dir.step);
+    // Steps - Docs
+    b.step("docs", "Install docs into zig-out/docs").dependOn(&docs_dir.step);
 
+    // Steps - Dist
     const dist_step = b.step("dist", "Cross-compile release binaries into zig-out/dist");
-
     for (dist_targets) |item| {
-        const resolved = b.resolveTargetQuery(item.query);
-
-        const dist_root_mod = b.createModule(.{
+        const dist_mod = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
-            .target = resolved,
+            .target = b.resolveTargetQuery(item.query),
             .optimize = .ReleaseFast,
             .link_libc = true,
         });
 
-        const exe = b.addExecutable(.{
+        const dist_bin = b.addExecutable(.{
             .name = "tfs",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
-                .target = resolved,
+                .target = b.resolveTargetQuery(item.query),
                 .optimize = .ReleaseFast,
                 .imports = &.{
-                    .{ .name = "tfs", .module = dist_root_mod },
+                    .{ .name = "tfs", .module = dist_mod },
                 },
             }),
             .use_llvm = true,
         });
 
-        const install = b.addInstallFileWithDir(
-            exe.getEmittedBin(),
+        dist_step.dependOn(&b.addInstallFileWithDir(
+            dist_bin.getEmittedBin(),
             .{ .custom = "dist" },
             item.output,
-        );
-
-        dist_step.dependOn(&install.step);
+        ).step);
     }
 
+    // Install
     b.installArtifact(main_bin);
-    b.installArtifact(root_test_bin);
     b.installArtifact(root_lib);
 }
